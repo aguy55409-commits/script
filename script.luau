@@ -62,11 +62,91 @@ local function main()
 		},
 	}
 
+	-- Remotes matching these are NOT probed (likely to kick / ban / flag you)
+	local SKIP_NAME_KEYWORDS = {
+		"kick",
+		"ban",
+		"boot",
+		"eject",
+		"punish",
+		"moderation",
+		"modkick",
+		"anticheat",
+		"antiexploit",
+		"anti_cheat",
+		"acban",
+		"acdetect",
+		"ac_kick",
+		"security",
+		"exploitdetect",
+		"cheatdetect",
+		"detection",
+		"detected",
+		"flagplayer",
+		"reportplayer",
+		"playerreport",
+		"votekick",
+		"removeplayer",
+		"tempban",
+		"permban",
+		"permaban",
+		"strike",
+		"disconnect",
+	}
+
+	local SKIP_PATH_KEYWORDS = {
+		"anticheat",
+		"antiexploit",
+		"anti.cheat",
+		"moderation",
+		"admin",
+		"security",
+		"punish",
+		"kick",
+		"ban",
+		"detection",
+		"acservice",
+		"exploit",
+	}
+
+	_G.__ExploitProbe_SkipRemotes = _G.__ExploitProbe_SkipRemotes or {}
+
 	local Report = { lines = {}, allRemotes = {}, manipulable = {} }
 	local screenGui, statusLabel, reportLabel, scrollFrame, pathInput
 	local lineCount = 0
 	local scanRunning = false
 	local activeConfig = SPEED_PRESETS.medium
+	local lastProbedPath = nil
+
+	local function matchesKeyword(text, keywords)
+		text = string.lower(text)
+		for _, kw in ipairs(keywords) do
+			if string.find(text, kw, 1, true) then
+				return kw
+			end
+		end
+		return nil
+	end
+
+	local function shouldSkipRemote(remote)
+		local path = remote:GetFullName()
+
+		if _G.__ExploitProbe_SkipRemotes[path] then
+			return "session blacklist (got kicked after probing this before)"
+		end
+
+		local nameHit = matchesKeyword(remote.Name, SKIP_NAME_KEYWORDS)
+		if nameHit then
+			return "kick-risk name contains '" .. nameHit .. "'"
+		end
+
+		local pathHit = matchesKeyword(path, SKIP_PATH_KEYWORDS)
+		if pathHit then
+			return "kick-risk path contains '" .. pathHit .. "'"
+		end
+
+		return nil
+	end
 
 	local function reportLine(text)
 		table.insert(Report.lines, text)
@@ -145,20 +225,30 @@ local function main()
 	end
 
 	local function collectRemotes()
-		local list = {}
+		local toProbe = {}
+		local skipped = {}
+
 		pcall(function()
 			for _, inst in ipairs(game:GetDescendants()) do
-				if inst:IsA("RemoteEvent") then
-					table.insert(list, inst)
-				elseif inst:IsA("RemoteFunction") and not activeConfig.skipRemoteFunctions then
-					table.insert(list, inst)
+				if inst:IsA("RemoteEvent") or (inst:IsA("RemoteFunction") and not activeConfig.skipRemoteFunctions) then
+					local skipReason = shouldSkipRemote(inst)
+					if skipReason then
+						table.insert(skipped, { remote = inst, reason = skipReason })
+					else
+						table.insert(toProbe, inst)
+					end
 				end
 			end
 		end)
-		table.sort(list, function(a, b)
+
+		table.sort(toProbe, function(a, b)
 			return a:GetFullName() < b:GetFullName()
 		end)
-		return list
+		table.sort(skipped, function(a, b)
+			return a.remote:GetFullName() < b.remote:GetFullName()
+		end)
+
+		return toProbe, skipped
 	end
 
 	local function mountGui()
@@ -203,7 +293,7 @@ local function main()
 		statusLabel.TextWrapped = true
 		statusLabel.TextColor3 = Color3.fromRGB(160, 210, 255)
 		statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-		statusLabel.Text = "Pick a speed: Slow (safest), Medium, Fast (most kicks). Report auto-copies during scan."
+		statusLabel.Text = "Skips kick/ban/AC remotes automatically. Pick Slow, Medium, or Fast."
 		statusLabel.Parent = panel
 
 		pathInput = Instance.new("TextBox")
@@ -323,17 +413,38 @@ local function main()
 		reportLine("NOTE: Kicked when scan ends? Your anti-cheat flagged the batch — script does NOT call Kick.")
 		reportLine("")
 
-		local remotes = collectRemotes()
-		reportLine("Found " .. #remotes .. " remotes to probe.")
+		local remotes, skippedRemotes = collectRemotes()
+
+		reportLine("Safe to probe: " .. #remotes .. " remotes")
+		reportLine("Skipped (kick-risk, NOT probed): " .. #skippedRemotes)
 		reportLine("")
 
+		if #skippedRemotes > 0 then
+			reportLine("========== SKIPPED — KICK / BAN / AC REMOTES ==========")
+			for i, entry in ipairs(skippedRemotes) do
+				local path = entry.remote:GetFullName()
+				Report.allRemotes[path] = {
+					index = i,
+					path = path,
+					className = entry.remote.ClassName,
+					status = "SKIPPED — " .. entry.reason,
+				}
+				reportLine(string.format("[skip %d] %s (%s)", i, path, entry.remote.ClassName))
+				reportLine("     → " .. entry.reason)
+			end
+			reportLine("")
+		end
+
 		if #remotes == 0 then
-			reportLine("No remotes found.")
+			reportLine("No safe remotes left to probe (all were kick-risk or none exist).")
 			flushDisplay(true)
-			statusLabel.Text = "No remotes."
+			statusLabel.Text = "Nothing safe to probe."
 			scanRunning = false
 			return
 		end
+
+		reportLine("========== PROBING SAFE REMOTES ONLY ==========")
+		reportLine("")
 
 		local manipCount = 0
 		local safeCount = 0
@@ -341,12 +452,18 @@ local function main()
 		for i, remote in ipairs(remotes) do
 			if not player.Parent then
 				reportLine("")
-				reportLine("STOPPED: You were kicked/disconnected (anti-cheat). Partial report saved to clipboard.")
+				reportLine("STOPPED: Kicked/disconnected. Partial report copied.")
+				if lastProbedPath then
+					_G.__ExploitProbe_SkipRemotes[lastProbedPath] = true
+					reportLine("Blacklisted: " .. lastProbedPath .. " (skipped next time)")
+				end
 				copyText()
 				scanRunning = false
 				flushDisplay(true)
 				return
 			end
+
+			lastProbedPath = remote:GetFullName()
 
 			local waitText = activeConfig.delay > 0 and string.format(" (%.1fs wait)", activeConfig.delay) or " (no delay)"
 			statusLabel.Text = string.format("[%s] Probing %d/%d%s", activeConfig.label, i, #remotes, waitText)
@@ -391,7 +508,12 @@ local function main()
 				end
 			end)
 			if resolveOk and (obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction")) then
-				probeOneRemote(obj, #remotes + 1)
+				local skipReason = shouldSkipRemote(obj)
+				if skipReason then
+					reportLine("     → SKIPPED — " .. skipReason)
+				else
+					probeOneRemote(obj, #remotes + 1)
+				end
 			else
 				reportLine("     → NOT FOUND")
 			end
