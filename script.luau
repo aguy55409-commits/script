@@ -1,36 +1,52 @@
 --[[
-  SERVER POPUP GUI — single file, run as-is
+  POPUP GUI — paste or loadstring this WHOLE file while IN PLAY MODE
 
-  Studio (your game):
-    1. View → Command Bar
-    2. Switch to SERVER (not Client)
-    3. Paste this entire file and press Enter — GUI shows right away
+  Works when you execute on CLIENT (executor / Studio Client bar) or SERVER.
 
-  Or: ServerScriptService → Insert Script → paste this file → Play
-
-  Inject (your own game / server-side executor):
-    Execute this script on the SERVER so buttons stay server-sided.
+  Loadstring:
+    local ok, err = pcall(function()
+      loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/script.luau", true))()
+    end)
+    if not ok then warn("[ServerPopupGui] ", err) end
 ]]
 
-if not game:GetService("RunService"):IsServer() then
-	warn("[ServerPopupGui] Run on SERVER only (Studio Command Bar → Server tab).")
-	return
-end
-
-if _G.__ServerPopupGuiLoaded then
-	return
-end
-_G.__ServerPopupGuiLoaded = true
-
 local Players = game:GetService("Players")
-local GUI_NAME = "ServerPopupGui"
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 
-local function createPopupGui(player)
+local GUI_NAME = "ServerPopupGui"
+local REMOTE_FOLDER_NAME = "ServerPopupGui_Remotes"
+local REMOTE_EVENT_NAME = "Action"
+
+local function getOrCreateRemotes()
+	local folder = ReplicatedStorage:FindFirstChild(REMOTE_FOLDER_NAME)
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = REMOTE_FOLDER_NAME
+		folder.Parent = ReplicatedStorage
+	end
+
+	local remote = folder:FindFirstChild(REMOTE_EVENT_NAME)
+	if not remote then
+		remote = Instance.new("RemoteEvent")
+		remote.Name = REMOTE_EVENT_NAME
+		remote.Parent = folder
+	end
+
+	return remote
+end
+
+local function createPopupGui(playerGui)
+	local existing = playerGui:FindFirstChild(GUI_NAME)
+	if existing then
+		existing:Destroy()
+	end
+
 	local screenGui = Instance.new("ScreenGui")
 	screenGui.Name = GUI_NAME
 	screenGui.ResetOnSpawn = false
 	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-	screenGui.Parent = player:WaitForChild("PlayerGui")
+	screenGui.Parent = playerGui
 
 	local overlay = Instance.new("Frame")
 	overlay.Name = "Overlay"
@@ -81,7 +97,7 @@ local function createPopupGui(player)
 	status.TextWrapped = true
 	status.TextXAlignment = Enum.TextXAlignment.Left
 	status.TextYAlignment = Enum.TextYAlignment.Top
-	status.Text = "All actions run on the server."
+	status.Text = "Ready."
 	status.Parent = panel
 
 	local input = Instance.new("TextBox")
@@ -158,7 +174,59 @@ local function createPopupGui(player)
 	return screenGui
 end
 
-local function bindGui(player, screenGui)
+local function startServer()
+	if _G.__ServerPopupGui_Server then
+		return
+	end
+	_G.__ServerPopupGui_Server = true
+
+	local remote = getOrCreateRemotes()
+
+	remote.OnServerEvent:Connect(function(player, action, payload)
+		if action == "submit" then
+			local message = payload
+			if type(message) ~= "string" or message == "" then
+				remote:FireClient(player, "Server: please enter a message first.")
+				return
+			end
+
+			local reply = string.format("Server received from %s: %s", player.Name, message)
+			print("[ServerPopupGui]", reply)
+			remote:FireClient(player, reply)
+		elseif action == "close" then
+			remote:FireClient(player, "Popup closed on the server.")
+		elseif action == "open" then
+			remote:FireClient(player, "Popup reopened from the server.")
+		end
+	end)
+
+	print("[ServerPopupGui] Server handler running.")
+end
+
+local function startClient()
+	if _G.__ServerPopupGui_Client then
+		return
+	end
+	_G.__ServerPopupGui_Client = true
+
+	local player = Players.LocalPlayer
+	if not player then
+		warn("[ServerPopupGui] Press PLAY first, then execute the script.")
+		return
+	end
+
+	local playerGui = player:FindFirstChild("PlayerGui") or player:WaitForChild("PlayerGui", 10)
+	if not playerGui then
+		warn("[ServerPopupGui] PlayerGui not found. Are you in Play mode?")
+		return
+	end
+
+	local remote = ReplicatedStorage:WaitForChild(REMOTE_FOLDER_NAME, 8)
+	if remote then
+		remote = remote:WaitForChild(REMOTE_EVENT_NAME, 5)
+	end
+
+	local screenGui = createPopupGui(playerGui)
 	local overlay = screenGui:WaitForChild("Overlay")
 	local panel = overlay:WaitForChild("Panel")
 	local status = panel:WaitForChild("Status")
@@ -172,50 +240,63 @@ local function bindGui(player, screenGui)
 		reopen.Visible = not isOpen
 	end
 
+	local function fire(action, payload)
+		if remote and remote:IsA("RemoteEvent") then
+			remote:FireServer(action, payload)
+			return true
+		end
+		return false
+	end
+
+	if remote and remote:IsA("RemoteEvent") then
+		remote.OnClientEvent:Connect(function(message)
+			status.Text = message
+		end)
+		status.Text = "Connected to server."
+	else
+		status.Text = "GUI open (server not loaded — buttons work locally only)."
+	end
+
 	submit.Activated:Connect(function()
 		local message = input.Text
 		if message == "" then
-			status.Text = "Server: please enter a message first."
+			status.Text = "Please enter a message first."
 			return
 		end
 
-		status.Text = string.format("Server received from %s: %s", player.Name, message)
-		print(string.format("[ServerPopupGui] %s sent: %s", player.Name, message))
-		input.Text = ""
+		if fire("submit", message) then
+			input.Text = ""
+		else
+			status.Text = "Local: " .. message
+			input.Text = ""
+		end
 	end)
 
 	close.Activated:Connect(function()
 		setOpen(false)
-		status.Text = "Popup closed. Use Open Menu to show again."
+		if not fire("close") then
+			status.Text = "Closed (local)."
+		end
 	end)
 
 	reopen.Activated:Connect(function()
 		setOpen(true)
-		status.Text = "Popup reopened from the server."
+		if not fire("open") then
+			status.Text = "Reopened (local)."
+		end
 	end)
 
 	setOpen(true)
+	print("[ServerPopupGui] Client GUI opened.")
 end
 
-local function giveGuiToPlayer(player)
-	local playerGui = player:FindFirstChild("PlayerGui") or player:WaitForChild("PlayerGui")
-	local existing = playerGui:FindFirstChild(GUI_NAME)
-	if existing then
-		existing:Destroy()
-	end
-
-	local screenGui = createPopupGui(player)
-	bindGui(player, screenGui)
+if RunService:IsServer() then
+	startServer()
 end
 
--- Runs immediately when you execute this script
-for _, player in Players:GetPlayers() do
-	task.spawn(giveGuiToPlayer, player)
+if RunService:IsClient() then
+	startClient()
 end
 
-Players.PlayerAdded:Connect(function(player)
-	player:WaitForChild("PlayerGui")
-	giveGuiToPlayer(player)
-end)
-
-print("[ServerPopupGui] Loaded — popup should be visible now.")
+-- Studio "Play Solo" runs this file on both server and client when executed once from a shared context.
+-- Executor usually runs client only: GUI still appears; run server half in ServerScriptService for real server replies.

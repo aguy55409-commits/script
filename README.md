@@ -1,23 +1,35 @@
-# script.luau — execute in your game
+# script.luau
 
-One file. Copy the whole thing, run it on the **server**, popup shows **immediately**.
+Popup GUI for **your** Roblox game. Run while **Play** is active.
 
-## Roblox Studio (your place)
+## Why it did nothing before
 
-1. Open your game in Studio and press **Play** (or Play Here).
-2. **View → Command Bar**
-3. Click **Server** (not Client) in the command bar.
-4. Open `script.luau`, copy **everything**, paste into the command bar, press **Enter**.
+1. **Not in Play mode** — `LocalPlayer` only exists after you press Play.
+2. **Ran on Server tab only** — old version quit on client; most executors run **client**.
+3. **HttpGet failed** — private repo or HTTP off → loadstring never ran. Use `loadstring.luau` (shows errors) or paste `script.luau` directly.
 
-The GUI should pop up right away for everyone in the server.
+## Executor (client) — GUI shows immediately
 
-**Permanent install:** ServerScriptService → Insert **Script** → paste `script.luau` → stop/restart play. It runs every session.
+1. Press **Play** in your game.
+2. Paste and run **`loadstring.luau`** (or the block below).
 
-## Inject (your own game)
+```lua
+local ok, err = pcall(function()
+	loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/script.luau", true))()
+end)
+if not ok then warn("[ServerPopupGui] Failed:", err) end
+```
 
-Use a **server-side** run (Studio Server command bar, or an executor that runs server scripts in **your** place). Client-only inject cannot drive a true server GUI.
+3. For **Send to Server** to hit the real server: also run the same script on the server once —
+   - Studio: Command Bar → **Server** → paste full `script.luau`, Enter  
+   - Or: **ServerScriptService** → Script → paste `script.luau` → Play
 
-## Buttons
+## Studio without executor
 
-- **Send to Server** — server reads your text and updates the label
-- **Close** / **Open Menu** — hide or show the popup (still server-side)
+1. **Play**
+2. Command Bar → **Client** → paste all of `script.luau` → Enter  
+   Popup should appear right away.
+
+## Paste instead of HttpGet
+
+If loadstring fails, paste the entire `script.luau` into the executor (no HttpGet).
