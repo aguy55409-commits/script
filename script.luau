@@ -9,6 +9,11 @@
 
 local USE_STEALTH_PAYLOAD = true
 
+-- Paste exact paths here after you see them in the log (e.g. the #32 remote):
+local SKIP_EXACT_PATHS = {
+	-- "ReplicatedStorage.SomeFolder.TheRemoteThatKicksYou",
+}
+
 local function main()
 	local Players = game:GetService("Players")
 	local RunService = game:GetService("RunService")
@@ -92,6 +97,15 @@ local function main()
 		"permaban",
 		"strike",
 		"disconnect",
+		"ping",
+		"heartbeat",
+		"validate",
+		"verify",
+		"integrity",
+		"sanity",
+		"moderate",
+		"262",
+		"267",
 	}
 
 	local SKIP_PATH_KEYWORDS = {
@@ -110,6 +124,26 @@ local function main()
 	}
 
 	_G.__ExploitProbe_SkipRemotes = _G.__ExploitProbe_SkipRemotes or {}
+	_G.__ExploitProbe_KickCulprits = _G.__ExploitProbe_KickCulprits or {}
+
+	local function placeKey()
+		return tostring(game.PlaceId)
+	end
+
+	local function rememberKickCulprit(path)
+		if not path then
+			return
+		end
+		_G.__ExploitProbe_SkipRemotes[path] = true
+		local culprits = _G.__ExploitProbe_KickCulprits[placeKey()] or {}
+		culprits[path] = true
+		_G.__ExploitProbe_KickCulprits[placeKey()] = culprits
+	end
+
+	local function isRememberedCulprit(path)
+		local culprits = _G.__ExploitProbe_KickCulprits[placeKey()]
+		return culprits and culprits[path]
+	end
 
 	local Report = { lines = {}, allRemotes = {}, manipulable = {} }
 	local screenGui, statusLabel, reportLabel, scrollFrame, pathInput
@@ -131,8 +165,18 @@ local function main()
 	local function shouldSkipRemote(remote)
 		local path = remote:GetFullName()
 
+		for _, exact in ipairs(SKIP_EXACT_PATHS) do
+			if path == exact then
+				return "manual SKIP_EXACT_PATHS list"
+			end
+		end
+
 		if _G.__ExploitProbe_SkipRemotes[path] then
-			return "session blacklist (got kicked after probing this before)"
+			return "blacklist (kicked you before when this was probed)"
+		end
+
+		if isRememberedCulprit(path) then
+			return "remembered kick remote for this game"
 		end
 
 		local nameHit = matchesKeyword(remote.Name, SKIP_NAME_KEYWORDS)
@@ -293,7 +337,7 @@ local function main()
 		statusLabel.TextWrapped = true
 		statusLabel.TextColor3 = Color3.fromRGB(160, 210, 255)
 		statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-		statusLabel.Text = "Skips kick/ban/AC remotes automatically. Pick Slow, Medium, or Fast."
+		statusLabel.Text = "Skips kick/ban/ping remotes. Shows exact path while probing. Culprit auto-blacklisted."
 		statusLabel.Parent = panel
 
 		pathInput = Instance.new("TextBox")
@@ -443,34 +487,67 @@ local function main()
 			return
 		end
 
-		reportLine("========== PROBING SAFE REMOTES ONLY ==========")
+		reportLine("========== PROBE ORDER (if kicked at X/X, it's #[X] below) ==========")
+		for i, remote in ipairs(remotes) do
+			local path = remote:GetFullName()
+			local marker = (i == #remotes) and "  <<< LAST — common kick spot" or ""
+			reportLine(string.format("[%d] %s (%s)%s", i, path, remote.ClassName, marker))
+		end
+		reportLine("")
+		flushDisplay(false)
+		copyText()
+
+		reportLine("========== PROBING (watch for >>> PROBING NOW lines) ==========")
 		reportLine("")
 
 		local manipCount = 0
 		local safeCount = 0
 
 		for i, remote in ipairs(remotes) do
+			local path = remote:GetFullName()
+			lastProbedPath = path
+
 			if not player.Parent then
 				reportLine("")
-				reportLine("STOPPED: Kicked/disconnected. Partial report copied.")
-				if lastProbedPath then
-					_G.__ExploitProbe_SkipRemotes[lastProbedPath] = true
-					reportLine("Blacklisted: " .. lastProbedPath .. " (skipped next time)")
-				end
+				reportLine("!!!!!!!!!! KICKED — CULPRIT REMOTE !!!!!!!!!!")
+				reportLine("This remote was firing when you got Error 267:")
+				reportLine(">>> " .. path)
+				reportLine("Index: [" .. i .. "/" .. #remotes .. "]")
+				rememberKickCulprit(path)
+				reportLine("Auto-blacklisted for this game + session. Won't probe again.")
 				copyText()
 				scanRunning = false
 				flushDisplay(true)
+				statusLabel.Text = "KICKED by: " .. path
 				return
 			end
 
-			lastProbedPath = remote:GetFullName()
+			local waitText = activeConfig.delay > 0 and string.format(" (%.1fs wait)", activeConfig.delay) or ""
+			statusLabel.Text = string.format("[%s] %d/%d%s\n%s", activeConfig.label, i, #remotes, waitText, path)
 
-			local waitText = activeConfig.delay > 0 and string.format(" (%.1fs wait)", activeConfig.delay) or " (no delay)"
-			statusLabel.Text = string.format("[%s] Probing %d/%d%s", activeConfig.label, i, #remotes, waitText)
+			if i == #remotes then
+				reportLine(">>> LAST REMOTE — kicks many people here:")
+			end
+			reportLine(">>> PROBING NOW [" .. i .. "/" .. #remotes .. "]: " .. path)
+			flushDisplay(false)
+
+			if i == #remotes or i % 5 == 0 then
+				copyText()
+			end
 
 			local ok, result = pcall(function()
 				return probeOneRemote(remote, i)
 			end)
+
+			if not player.Parent then
+				reportLine("     → KICKED while probing this remote (Error 267)")
+				rememberKickCulprit(path)
+				copyText()
+				flushDisplay(true)
+				statusLabel.Text = "KICKED by: " .. path
+				scanRunning = false
+				return
+			end
 
 			if not ok then
 				local path = remote:GetFullName()
