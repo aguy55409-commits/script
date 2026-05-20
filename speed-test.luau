@@ -1,8 +1,8 @@
 --[[
-  SPEED EXPLOIT TEST — apply + add speed, watch leaderstats.Speed (like Wins).
+  SPEED TEST — turbo treadmill ticks -> leaderstats.Speed (like Wins).
 
-  Each tick: sends rising speed values to game remotes (apply/set + add amount).
-  Only success = leaderstats.Speed actually changed.
+  Stand on treadmill, set Ticks/burst + Burst delay, Start.
+  Spams TreadmillSignal fast so speed climbs faster than normal.
 
   loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/speed-test.luau", true))()
 ]]
@@ -21,36 +21,27 @@ if not player then
 end
 
 local GUI_NAME = "SpeedExploitTest"
-
-local ACTION_REMOTES = {
-	{ name = "SetCustomSpeed", path = "ReplicatedStorage.Remotes.SetCustomSpeed" },
-	{ name = "UpdateSpeed", path = "ReplicatedStorage.Remotes.UpdateSpeed" },
-	{ name = "TreadmillSignal", path = "ReplicatedStorage.Remotes.TreadmillSignal" },
-}
-
+local TREADMILL_PATH = "ReplicatedStorage.Remotes.TreadmillSignal"
 local SPEED_STAT_NAME = "Speed"
-local WINS_STAT_NAME = "Wins"
 
 local running = false
-local startSpeed = 1000
-local stepSpeed = 10000
-local maxSpeed = 1e15
-local interval = 0.5
+local ticksPerBurst = 40
+local burstDelay = 0.03
+local logEveryNBursts = 5
 
 local logLines = {}
 local statusLabel
 local liveSpeedLabel
 local logLabel
-local startBox
-local stepBox
-local intervalBox
-local bestApplyPayload = nil
-local bestAddPayload = nil
+local ticksBox
+local delayBox
+local bestTreadmillPayload = { label = "empty", args = {} }
 local updateSpeedHooked = false
+local lastLoggedSpeed = nil
 
 local function log(text)
 	table.insert(logLines, text)
-	if #logLines > 80 then
+	if #logLines > 60 then
 		table.remove(logLines, 1)
 	end
 	print("[SpeedTest] " .. text)
@@ -70,26 +61,19 @@ local function resolvePath(path)
 	return obj
 end
 
-local function readLeaderstat(statName)
+local function getSpeedStat()
 	local ls = player:FindFirstChild("leaderstats")
 	if not ls then
 		return nil
 	end
-	local stat = ls:FindFirstChild(statName)
+	local stat = ls:FindFirstChild(SPEED_STAT_NAME)
 	if not stat then
 		return nil
 	end
-	if stat:IsA("NumberValue") or stat:IsA("IntValue") then
-		return stat.Value
-	end
-	if stat:IsA("StringValue") then
+	if stat:IsA("NumberValue") or stat:IsA("IntValue") or stat:IsA("StringValue") then
 		return stat.Value
 	end
 	return nil
-end
-
-local function getSpeedStat()
-	return readLeaderstat(SPEED_STAT_NAME)
 end
 
 local function parseStatNumber(value)
@@ -97,8 +81,7 @@ local function parseStatNumber(value)
 		return value
 	end
 	if type(value) == "string" then
-		local cleaned = value:gsub(",", ""):gsub("%s+", "")
-		return tonumber(cleaned)
+		return tonumber(value:gsub(",", ""))
 	end
 	return nil
 end
@@ -106,46 +89,41 @@ end
 local function formatLiveStats()
 	local speed = getSpeedStat()
 	if speed == nil then
-		return "(leaderstats.Speed not found yet)"
+		return "leaderstats.Speed not found"
 	end
-	local wins = readLeaderstat(WINS_STAT_NAME)
-	local line = string.format("leaderstats.Speed=%s", tostring(speed))
-	if wins ~= nil then
-		line ..= string.format(" | Wins=%s", tostring(wins))
-	end
-	return line
+	return "leaderstats.Speed = " .. tostring(speed)
 end
 
-local function speedStatChanged(before, after)
-	return tostring(before) ~= tostring(after)
-end
-
-local function speedStatIncreased(before, after)
-	local b = parseStatNumber(before)
-	local a = parseStatNumber(after)
+local function speedDelta(before, after)
+	local b, a = parseStatNumber(before), parseStatNumber(after)
 	if b and a then
-		return a > b, a - b
+		return a - b, tostring(a - b)
 	end
-	return speedStatChanged(before, after), nil
+	if tostring(before) ~= tostring(after) then
+		return nil, tostring(before) .. " -> " .. tostring(after)
+	end
+	return 0, "0"
 end
 
-local function updateLiveSpeedLabel()
-	if liveSpeedLabel then
-		liveSpeedLabel.Text = "Tracking: " .. formatLiveStats()
+local function updateLiveSpeedLabel(extra)
+	if not liveSpeedLabel then
+		return
 	end
+	local line = formatLiveStats()
+	if extra then
+		line ..= " | " .. extra
+	end
+	liveSpeedLabel.Text = line
 end
 
 local function discoverSpeedStats()
 	log("=== DISCOVER ===")
 	local speed = getSpeedStat()
 	if speed == nil then
-		log("leaderstats.Speed not found — wait for stats to load.")
+		log("No leaderstats.Speed — join game first.")
 	else
-		log(string.format("  leaderstats.Speed = %s", tostring(speed)))
-	end
-	local wins = readLeaderstat(WINS_STAT_NAME)
-	if wins ~= nil then
-		log(string.format("  leaderstats.Wins = %s", tostring(wins)))
+		log("Speed = " .. tostring(speed))
+		lastLoggedSpeed = speed
 	end
 	updateLiveSpeedLabel()
 end
@@ -157,270 +135,159 @@ local function hookUpdateSpeedListener()
 	local remote = resolvePath("ReplicatedStorage.Remotes.UpdateSpeed")
 	if remote and remote:IsA("RemoteEvent") then
 		remote.OnClientEvent:Connect(function(...)
-			local args = { ... }
-			local parts = {}
-			for i, v in ipairs(args) do
-				parts[i] = typeof(v) .. "=" .. tostring(v)
-			end
-			log("<< server UpdateSpeed: " .. table.concat(parts, ", "))
-			updateLiveSpeedLabel()
+			updateLiveSpeedLabel("server synced")
 		end)
 		updateSpeedHooked = true
 	end
 end
 
--- Build payloads that APPLY a total speed or ADD an amount
-local function buildApplyTrials(applyAmount)
-	local n = applyAmount
-	local s = tostring(n)
-	return {
-		{ label = "apply number", mode = "apply", args = { n } },
-		{ label = "apply string", mode = "apply", args = { s } },
-		{ label = "Speed, number", mode = "apply", args = { "Speed", n } },
-		{ label = "speed, string", mode = "apply", args = { "speed", s } },
-		{ label = "set, number", mode = "apply", args = { "set", n } },
-	}
+local function getTreadmillRemote()
+	return resolvePath(TREADMILL_PATH)
 end
 
-local function buildAddTrials(addAmount, applyAmount)
-	local step = addAmount
-	local total = applyAmount
-	local cur = parseStatNumber(getSpeedStat()) or 0
-	return {
-		{ label = "add number", mode = "add", args = { step } },
-		{ label = "add string", mode = "add", args = { tostring(step) } },
-		{ label = "Add, number", mode = "add", args = { "Add", step } },
-		{ label = "add speed key", mode = "add", args = { "Speed", step } },
-		{ label = "apply total", mode = "apply", args = { total } },
-		{ label = "apply cur+step", mode = "apply", args = { cur + step } },
-	}
-end
-
-local function fireRemote(remote, args)
-	if remote:IsA("RemoteEvent") then
+local function fireTreadmillBurst(remote, args, count)
+	for _ = 1, count do
+		if not running then
+			break
+		end
 		remote:FireServer(table.unpack(args))
-	elseif remote:IsA("RemoteFunction") then
-		remote:InvokeServer(table.unpack(args))
 	end
 end
 
-local function tryPayload(remoteInfo, trial)
-	local remote = resolvePath(remoteInfo.path)
-	if not remote then
-		return false, "remote missing"
-	end
-
-	local before = getSpeedStat()
-	local ok, err = pcall(function()
-		fireRemote(remote, trial.args)
-	end)
-	if not ok then
-		return false, err
-	end
-
-	task.wait(0.2)
-	local after = getSpeedStat()
-	local changed = speedStatChanged(before, after)
-	local increased, delta = speedStatIncreased(before, after)
-
-	if trial.mode == "add" and increased then
-		return true, string.format("ADDED +%s (%s -> %s)", tostring(delta or "?"), before, after), trial
-	elseif trial.mode == "apply" and changed then
-		return true, string.format("APPLIED (%s -> %s)", before, after), trial
-	elseif changed then
-		return true, string.format("CHANGED (%s -> %s)", before, after), trial
-	end
-	return false, "no change to leaderstats.Speed", nil
-end
+local TREADMILL_TRIALS = {
+	{ label = "empty tick", args = {} },
+	{ label = "true", args = { true } },
+	{ label = "1", args = { 1 } },
+	{ label = "tick string", args = { "tick" } },
+	{ label = "run", args = { "run" } },
+}
 
 local function runProbeOnce()
-	startSpeed = tonumber(startBox.Text) or startSpeed
-	stepSpeed = tonumber(stepBox.Text) or stepSpeed
+	ticksPerBurst = math.clamp(tonumber(ticksBox.Text) or 20, 1, 200)
 
-	log("=== PROBE (find apply + add payloads) ===")
+	log("=== PROBE treadmill (stand on treadmill!) ===")
+	local remote = getTreadmillRemote()
+	if not remote then
+		log("TreadmillSignal not found.")
+		return
+	end
+
 	hookUpdateSpeedListener()
-	bestApplyPayload = nil
-	bestAddPayload = nil
+	local bestGain = 0
+	local bestTrial = TREADMILL_TRIALS[1]
 
-	for _, info in ipairs(ACTION_REMOTES) do
-		log("Probing " .. info.name .. " ...")
-
-		for _, trial in ipairs(buildApplyTrials(startSpeed)) do
-			local ok, msg, saved = tryPayload(info, trial)
-			if ok then
-				bestApplyPayload = { remote = info, trial = saved }
-				log("  APPLY OK: " .. info.name .. " / " .. trial.label .. " — " .. msg)
-				break
-			else
-				log("  .. apply " .. trial.label)
+	for _, trial in ipairs(TREADMILL_TRIALS) do
+		local before = getSpeedStat()
+		local ok, err = pcall(function()
+			fireTreadmillBurst(remote, trial.args, ticksPerBurst)
+		end)
+		if not ok then
+			log("  FAIL " .. trial.label .. ": " .. tostring(err))
+		else
+			task.wait(0.35)
+			local after = getSpeedStat()
+			local numDelta = speedDelta(before, after)
+			local gain = 0
+			if type(numDelta) == "number" then
+				gain = numDelta
+			elseif numDelta == nil and before ~= after then
+				gain = 1
 			end
-			task.wait(0.08)
-		end
-
-		for _, trial in ipairs(buildAddTrials(stepSpeed, startSpeed)) do
-			local ok, msg, saved = tryPayload(info, trial)
-			if ok and trial.mode == "add" then
-				bestAddPayload = { remote = info, trial = saved }
-				log("  ADD OK: " .. info.name .. " / " .. trial.label .. " — " .. msg)
-				break
-			elseif ok then
-				log("  .. " .. trial.label .. " changed stat but not pure add")
-			else
-				log("  .. add " .. trial.label)
+			log(string.format("  %s x%d -> gain %s", trial.label, ticksPerBurst, tostring(numDelta or (before .. "->" .. after))))
+			if gain > bestGain then
+				bestGain = gain
+				bestTrial = trial
 			end
-			task.wait(0.08)
 		end
+		task.wait(0.15)
 	end
 
-	updateLiveSpeedLabel()
-	if bestApplyPayload or bestAddPayload then
-		log("Probe done — Start will use working apply/add payloads.")
-	else
-		log("Probe: nothing moved leaderstats.Speed. Server may be blocking.")
-	end
+	bestTreadmillPayload = bestTrial
+	log(string.format("Best: %s (gain %s). Hit Start.", bestTrial.label, tostring(bestGain)))
+	updateLiveSpeedLabel("probe: " .. bestTrial.label)
 end
 
-local function rebuildTrialArgs(trial, applyAmount, addAmount)
-	local mode = trial.mode
-	local args = {}
-
-	if mode == "add" then
-		for _, v in ipairs(trial.args) do
-			if type(v) == "number" then
-				table.insert(args, addAmount)
-			elseif type(v) == "string" and v ~= "Add" and v ~= "Speed" and v ~= "speed" and v ~= "add" then
-				table.insert(args, tostring(addAmount))
-			else
-				table.insert(args, v)
-			end
-		end
-	else
-		for _, v in ipairs(trial.args) do
-			if type(v) == "number" then
-				table.insert(args, applyAmount)
-			elseif type(v) == "string" and v ~= "Speed" and v ~= "speed" and v ~= "set" and v ~= "Add" and v ~= "add" then
-				table.insert(args, tostring(applyAmount))
-			else
-				table.insert(args, v)
-			end
-		end
-	end
-
-	return args
-end
-
-local function runSpeedLoop()
+local function runTurboLoop()
 	if running then
 		return
 	end
-	running = true
 
-	startSpeed = tonumber(startBox.Text) or startSpeed
-	stepSpeed = tonumber(stepBox.Text) or stepSpeed
-	interval = tonumber(intervalBox.Text) or interval
+	local remote = getTreadmillRemote()
+	if not remote then
+		log("TreadmillSignal missing.")
+		return
+	end
+
+	running = true
+	ticksPerBurst = math.clamp(tonumber(ticksBox.Text) or 40, 1, 500)
+	burstDelay = math.clamp(tonumber(delayBox.Text) or 0.03, 0, 2)
 
 	hookUpdateSpeedListener()
-	log("=== LOOP: apply rising speed + add step each tick ===")
-	log(string.format("Start apply=%s | Add per tick=%s | Max=%s", startSpeed, stepSpeed, maxSpeed))
+	log("=== TURBO TREADMILL ===")
+	log(string.format("%d ticks/burst | %.3fs between bursts", ticksPerBurst, burstDelay))
+	log("STAND ON TREADMILL. Watching leaderstats.Speed.")
 
-	local applyAmount = startSpeed
-	local tickCount = 0
+	local burstCount = 0
+	local totalGain = 0
+	local sessionStart = getSpeedStat()
 
 	while running do
 		if not player.Parent then
-			log("STOPPED — kicked or left.")
+			log("Kicked or left.")
 			break
 		end
 
-		tickCount += 1
+		burstCount += 1
 		local before = getSpeedStat()
-		log(string.format("--- tick %d | send apply=%s add=%s | Speed=%s ---", tickCount, applyAmount, stepSpeed, tostring(before)))
 
-		local anyEffect = false
-		local attempts = {}
+		local ok, err = pcall(function()
+			fireTreadmillBurst(remote, bestTreadmillPayload.args, ticksPerBurst)
+		end)
 
-		if bestApplyPayload then
-			table.insert(attempts, {
-				name = bestApplyPayload.remote.name,
-				path = bestApplyPayload.remote.path,
-				label = "apply " .. bestApplyPayload.trial.label,
-				args = rebuildTrialArgs(bestApplyPayload.trial, applyAmount, stepSpeed),
-			})
-		end
-		if bestAddPayload then
-			table.insert(attempts, {
-				name = bestAddPayload.remote.name,
-				path = bestAddPayload.remote.path,
-				label = "add " .. bestAddPayload.trial.label,
-				args = rebuildTrialArgs(bestAddPayload.trial, applyAmount, stepSpeed),
-			})
+		if not ok then
+			log("Burst error: " .. tostring(err))
+			break
 		end
 
-		-- No probe yet: try default apply + add on main remotes
-		if #attempts == 0 then
-			for _, info in ipairs(ACTION_REMOTES) do
-				if info.name ~= "TreadmillSignal" then
-					table.insert(attempts, {
-						name = info.name,
-						path = info.path,
-						label = "default apply",
-						args = { applyAmount },
-					})
-					table.insert(attempts, {
-						name = info.name,
-						path = info.path,
-						label = "default add",
-						args = { stepSpeed },
-					})
-				end
+		if burstDelay > 0 then
+			task.wait(burstDelay)
+		end
+
+		local after = getSpeedStat()
+		local numDelta, deltaStr = speedDelta(before, after)
+
+		if type(numDelta) == "number" and numDelta > 0 then
+			totalGain += numDelta
+		end
+
+		if burstCount % logEveryNBursts == 0 or (numDelta and numDelta ~= 0) then
+			local rate = ""
+			if type(numDelta) == "number" and burstDelay > 0 then
+				rate = string.format(" (~%.0f/s)", numDelta / burstDelay)
 			end
+			log(string.format("burst %d | +%s | Speed=%s%s", burstCount, deltaStr, tostring(after), rate))
+			lastLoggedSpeed = after
 		end
 
-		-- Treadmill tick + apply/add
-		table.insert(attempts, {
-			name = "TreadmillSignal",
-			path = "ReplicatedStorage.Remotes.TreadmillSignal",
-			label = "treadmill",
-			args = {},
-		})
+		statusLabel.Text = string.format(
+			"Turbo x%d | burst %d | Speed=%s | +%s total",
+			ticksPerBurst,
+			burstCount,
+			tostring(after),
+			tostring(totalGain)
+		)
+		updateLiveSpeedLabel(string.format("+%s last burst", deltaStr))
 
-		for _, attempt in ipairs(attempts) do
-			local ok, err = pcall(function()
-				local remote = resolvePath(attempt.path)
-				fireRemote(remote, attempt.args)
-			end)
-			if ok then
-				task.wait(0.12)
-				local after = getSpeedStat()
-				if speedStatChanged(before, after) then
-					anyEffect = true
-					local increased, delta = speedStatIncreased(before, after)
-					if increased then
-						log(string.format("  %s [%s] Speed %s -> %s (+%s)", attempt.name, attempt.label, before, after, tostring(delta or "?")))
-					else
-						log(string.format("  %s [%s] Speed %s -> %s", attempt.name, attempt.label, before, after))
-					end
-					before = after
-				end
-			else
-				log(string.format("  FAIL %s: %s", attempt.name, tostring(err)))
-			end
+		-- No gain for many bursts = probably not on treadmill or server blocking
+		if burstCount == 10 and totalGain == 0 and sessionStart == after then
+			log("WARN: Speed not moving — are you ON the treadmill?")
 		end
-
-		if not anyEffect then
-			log("  NO CHANGE — server blocked or wrong payload (run Probe first).")
-		end
-
-		statusLabel.Text = string.format("Tick %d | apply %s | Speed=%s | %s", tickCount, applyAmount, tostring(before), anyEffect and "OK" or "blocked")
-		updateLiveSpeedLabel()
-
-		applyAmount = math.min(applyAmount + stepSpeed, maxSpeed)
-		task.wait(interval)
 	end
 
 	running = false
+	local finalSpeed = getSpeedStat()
+	log(string.format("=== STOPPED | %d bursts | Speed %s -> %s ===", burstCount, tostring(sessionStart), tostring(finalSpeed)))
 	statusLabel.Text = "Stopped."
-	log("=== LOOP END ===")
 end
 
 -- === GUI ===
@@ -444,7 +311,7 @@ end
 local panel = Instance.new("Frame")
 panel.AnchorPoint = Vector2.new(0.5, 0.5)
 panel.Position = UDim2.fromScale(0.5, 0.5)
-panel.Size = UDim2.fromOffset(440, 480)
+panel.Size = UDim2.fromOffset(420, 440)
 panel.BackgroundColor3 = Color3.fromRGB(24, 26, 34)
 panel.Parent = screenGui
 Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
@@ -457,31 +324,31 @@ title.Font = Enum.Font.GothamBold
 title.TextSize = 16
 title.TextColor3 = Color3.fromRGB(255, 255, 255)
 title.TextXAlignment = Enum.TextXAlignment.Left
-title.Text = "Speed Test (apply + add)"
+title.Text = "Turbo Treadmill Speed Test"
 title.Parent = panel
 
 statusLabel = Instance.new("TextLabel")
 statusLabel.BackgroundTransparency = 1
 statusLabel.Position = UDim2.fromOffset(12, 32)
-statusLabel.Size = UDim2.new(1, -24, 0, 36)
+statusLabel.Size = UDim2.new(1, -24, 0, 40)
 statusLabel.Font = Enum.Font.Gotham
 statusLabel.TextSize = 11
 statusLabel.TextWrapped = true
 statusLabel.TextColor3 = Color3.fromRGB(160, 210, 255)
 statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-statusLabel.Text = "Applies rising speed + adds step — checks leaderstats.Speed only."
+statusLabel.Text = "Spam TreadmillSignal bursts — must stand on treadmill."
 statusLabel.Parent = panel
 
 liveSpeedLabel = Instance.new("TextLabel")
 liveSpeedLabel.BackgroundTransparency = 1
-liveSpeedLabel.Position = UDim2.fromOffset(12, 68)
-liveSpeedLabel.Size = UDim2.new(1, -24, 0, 36)
+liveSpeedLabel.Position = UDim2.fromOffset(12, 72)
+liveSpeedLabel.Size = UDim2.new(1, -24, 0, 32)
 liveSpeedLabel.Font = Enum.Font.Code
 liveSpeedLabel.TextSize = 10
 liveSpeedLabel.TextWrapped = true
 liveSpeedLabel.TextColor3 = Color3.fromRGB(255, 220, 120)
 liveSpeedLabel.TextXAlignment = Enum.TextXAlignment.Left
-liveSpeedLabel.Text = "Tracking: ..."
+liveSpeedLabel.Text = "..."
 liveSpeedLabel.Parent = panel
 
 local function numBox(label, y, default)
@@ -498,7 +365,7 @@ local function numBox(label, y, default)
 
 	local b = Instance.new("TextBox")
 	b.Position = UDim2.fromOffset(150, y - 2)
-	b.Size = UDim2.fromOffset(278, 24)
+	b.Size = UDim2.fromOffset(258, 24)
 	b.BackgroundColor3 = Color3.fromRGB(14, 16, 22)
 	b.TextColor3 = Color3.fromRGB(255, 255, 255)
 	b.Font = Enum.Font.Code
@@ -510,13 +377,12 @@ local function numBox(label, y, default)
 	return b
 end
 
-startBox = numBox("Apply speed", 108, startSpeed)
-stepBox = numBox("Add per tick", 136, stepSpeed)
-intervalBox = numBox("Seconds", 164, interval)
+ticksBox = numBox("Ticks/burst", 108, ticksPerBurst)
+delayBox = numBox("Burst delay", 136, burstDelay)
 
 local scroll = Instance.new("ScrollingFrame")
-scroll.Position = UDim2.fromOffset(12, 196)
-scroll.Size = UDim2.new(1, -24, 1, -100)
+scroll.Position = UDim2.fromOffset(12, 168)
+scroll.Size = UDim2.new(1, -24, 1, -108)
 scroll.BackgroundColor3 = Color3.fromRGB(12, 14, 20)
 scroll.BorderSizePixel = 0
 scroll.ScrollBarThickness = 8
@@ -539,7 +405,7 @@ logLabel.Parent = scroll
 
 local function btn(text, x, w, fn, col)
 	local b = Instance.new("TextButton")
-	b.Position = UDim2.fromOffset(x, 438)
+	b.Position = UDim2.fromOffset(x, 398)
 	b.Size = UDim2.fromOffset(w, 32)
 	b.BackgroundColor3 = col or Color3.fromRGB(45, 120, 70)
 	b.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -556,11 +422,11 @@ btn("Probe", 92, 72, function()
 	task.spawn(runProbeOnce)
 end, Color3.fromRGB(80, 130, 90))
 btn("Start", 172, 72, function()
-	task.spawn(runSpeedLoop)
+	task.spawn(runTurboLoop)
 end)
 btn("Stop", 252, 72, function()
 	running = false
-	log("Stop requested.")
+	log("Stop.")
 end, Color3.fromRGB(180, 70, 70))
 btn("Close", 332, 72, function()
 	running = false
@@ -570,12 +436,12 @@ end, Color3.fromRGB(80, 85, 100))
 task.spawn(function()
 	while screenGui.Parent do
 		updateLiveSpeedLabel()
-		task.wait(0.5)
+		task.wait(0.25)
 	end
 end)
 
 hookUpdateSpeedListener()
 discoverSpeedStats()
-log("Watches leaderstats.Speed only.")
-log("Apply = set total speed | Add = +step per tick (both rise each loop).")
-log("Probe -> Start. Remotes: SetCustomSpeed, UpdateSpeed, TreadmillSignal.")
+log("Turbo = many TreadmillSignal fires per burst.")
+log("Try: Ticks/burst 50-100, Burst delay 0.01-0.03")
+log("Stand on treadmill -> Probe -> Start")

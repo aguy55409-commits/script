@@ -12,7 +12,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/scr
 
 ## 2. Speed exploit test (`speed-test.luau`)
 
-Tracks **leaderstats.Speed** only (like Wins). Each tick **applies** a rising speed value and **adds** the step amount via `SetCustomSpeed` / `UpdateSpeed`. Use **Discover → Probe → Start**.
+**Turbo treadmill** mode: spams `TreadmillSignal` in fast bursts to raise `leaderstats.Speed` faster. Stand on treadmill, set **Ticks/burst** + **Burst delay**, then **Probe → Start**.
 
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/speed-test.luau", true))()
