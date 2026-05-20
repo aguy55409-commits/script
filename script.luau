@@ -1,10 +1,18 @@
 --[[
   REMOTE MANIPULATION PROBE — Potassium, in-game only.
 
+  Kicked at the end? That's YOUR anti-cheat — not this script.
+  It fires many remotes quickly; AC often kicks after the batch finishes.
+
   loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/script.luau", true))()
 ]]
 
-local PROBE_TIMEOUT = 1.25
+-- Tweak these if you get kicked before the report finishes:
+local PROBE_TIMEOUT = 1.0
+local DELAY_BETWEEN_REMOTES = 0.65 -- seconds (raise to 1.5 if still kicked)
+local SKIP_REMOTE_FUNCTIONS = true -- InvokeServer triggers more AC kicks
+local USE_STEALTH_PAYLOAD = true -- no obvious __AC_PROBE__ signature
+local AUTO_COPY_EVERY = 8 -- copy report to clipboard every N remotes (save before kick)
 
 local function main()
 	local Players = game:GetService("Players")
@@ -21,7 +29,6 @@ local function main()
 	end
 
 	local GUI_NAME = "ServerExploitProbe"
-	local PROBE_TAG = "__AC_PROBE__"
 
 	_G.__ServerExploitProbeLoaded = nil
 	for _, root in ipairs({ CoreGui, player:FindFirstChild("PlayerGui") }) do
@@ -36,6 +43,7 @@ local function main()
 	local Report = { lines = {}, allRemotes = {}, manipulable = {} }
 	local screenGui, statusLabel, reportLabel, scrollFrame, pathInput
 	local lineCount = 0
+	local scanRunning = false
 
 	local function reportLine(text)
 		table.insert(Report.lines, text)
@@ -54,12 +62,8 @@ local function main()
 		end
 	end
 
-	local function getFullReportText()
-		return table.concat(Report.lines, "\n")
-	end
-
 	local function copyText()
-		local text = getFullReportText()
+		local text = table.concat(Report.lines, "\n")
 		if text == "" then
 			return false, 0
 		end
@@ -76,7 +80,13 @@ local function main()
 		return false, #text
 	end
 
-	-- One attempt per remote. Timeout = stop waiting (cannot manipulate). No spam, no retries.
+	local function getProbePayload()
+		if USE_STEALTH_PAYLOAD then
+			return "test"
+		end
+		return "__AC_PROBE__", "manipulate_test"
+	end
+
 	local function tryManipulate(remote)
 		local finished = false
 		local canManipulate = false
@@ -85,9 +95,9 @@ local function main()
 		task.spawn(function()
 			local ok, err = pcall(function()
 				if remote:IsA("RemoteEvent") then
-					remote:FireServer(PROBE_TAG, "manipulate_test")
+					remote:FireServer(getProbePayload())
 				else
-					remote:InvokeServer(PROBE_TAG, "manipulate_test")
+					remote:InvokeServer(getProbePayload())
 				end
 			end)
 			canManipulate = ok
@@ -101,9 +111,8 @@ local function main()
 		end
 
 		if not finished then
-			return false, "timeout — stopped (not manipulable)"
+			return false, "timeout — stopped"
 		end
-
 		if canManipulate then
 			return true, reason
 		end
@@ -114,7 +123,9 @@ local function main()
 		local list = {}
 		pcall(function()
 			for _, inst in ipairs(game:GetDescendants()) do
-				if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") then
+				if inst:IsA("RemoteEvent") then
+					table.insert(list, inst)
+				elseif inst:IsA("RemoteFunction") and not SKIP_REMOTE_FUNCTIONS then
 					table.insert(list, inst)
 				end
 			end
@@ -161,17 +172,17 @@ local function main()
 		statusLabel = Instance.new("TextLabel")
 		statusLabel.BackgroundTransparency = 1
 		statusLabel.Position = UDim2.fromOffset(12, 34)
-		statusLabel.Size = UDim2.new(1, -24, 0, 36)
+		statusLabel.Size = UDim2.new(1, -24, 0, 48)
 		statusLabel.Font = Enum.Font.Gotham
-		statusLabel.TextSize = 12
+		statusLabel.TextSize = 11
 		statusLabel.TextWrapped = true
 		statusLabel.TextColor3 = Color3.fromRGB(160, 210, 255)
 		statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-		statusLabel.Text = "One probe per remote — stops each if not manipulable."
+		statusLabel.Text = "Kicked at end = your AC detected the scan (working). Press Probe All. Report auto-copies during scan."
 		statusLabel.Parent = panel
 
 		pathInput = Instance.new("TextBox")
-		pathInput.Position = UDim2.fromOffset(12, 74)
+		pathInput.Position = UDim2.fromOffset(12, 86)
 		pathInput.Size = UDim2.new(1, -24, 0, 28)
 		pathInput.BackgroundColor3 = Color3.fromRGB(12, 14, 20)
 		pathInput.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -182,8 +193,8 @@ local function main()
 		Instance.new("UICorner", pathInput).CornerRadius = UDim.new(0, 6)
 
 		scrollFrame = Instance.new("ScrollingFrame")
-		scrollFrame.Position = UDim2.fromOffset(12, 110)
-		scrollFrame.Size = UDim2.new(1, -24, 1, -158)
+		scrollFrame.Position = UDim2.fromOffset(12, 122)
+		scrollFrame.Size = UDim2.new(1, -24, 1, -170)
 		scrollFrame.BackgroundColor3 = Color3.fromRGB(10, 12, 18)
 		scrollFrame.BorderSizePixel = 0
 		scrollFrame.ScrollBarThickness = 10
@@ -207,7 +218,7 @@ local function main()
 		reportLabel.TextYAlignment = Enum.TextYAlignment.Top
 		reportLabel.TextWrapped = true
 		reportLabel.AutomaticSize = Enum.AutomaticSize.Y
-		reportLabel.Text = ""
+		reportLabel.Text = "Press Probe All to start."
 		reportLabel.Parent = content
 
 		local function btn(text, x, w, fn, col)
@@ -239,7 +250,6 @@ local function main()
 		if not probeOk then
 			status = "PROBE ERROR — " .. tostring(canManipulate)
 			canManipulate = false
-			detail = status
 		elseif canManipulate then
 			status = "MANIPULABLE — " .. tostring(detail)
 			Report.manipulable[path] = true
@@ -260,6 +270,11 @@ local function main()
 	end
 
 	local function runScan()
+		if scanRunning then
+			return
+		end
+		scanRunning = true
+
 		Report.lines = {}
 		Report.allRemotes = {}
 		Report.manipulable = {}
@@ -267,17 +282,26 @@ local function main()
 
 		reportLine("=== REMOTE MANIPULATION PROBE ===")
 		reportLine("Player: " .. player.Name .. " | PlaceId: " .. game.PlaceId)
-		reportLine("Rule: 1 attempt per remote, " .. PROBE_TIMEOUT .. "s max, then stop that remote.")
+		reportLine("Delay: " .. DELAY_BETWEEN_REMOTES .. "s between remotes")
+		if SKIP_REMOTE_FUNCTIONS then
+			reportLine("Mode: RemoteEvent only (skips RemoteFunction — less kicks)")
+		end
+		if USE_STEALTH_PAYLOAD then
+			reportLine("Payload: stealth (no __AC_PROBE__ tag)")
+		end
+		reportLine("")
+		reportLine("NOTE: Kicked when scan ends? Your anti-cheat flagged the batch — script does NOT call Kick.")
 		reportLine("")
 
 		local remotes = collectRemotes()
-		reportLine("Found " .. #remotes .. " remotes. Probing...")
+		reportLine("Found " .. #remotes .. " remotes to probe.")
 		reportLine("")
 
 		if #remotes == 0 then
-			reportLine("No remotes in game.")
+			reportLine("No remotes found.")
 			flushDisplay(true)
-			statusLabel.Text = "No remotes found."
+			statusLabel.Text = "No remotes."
+			scanRunning = false
 			return
 		end
 
@@ -285,9 +309,16 @@ local function main()
 		local safeCount = 0
 
 		for i, remote in ipairs(remotes) do
-			if statusLabel then
-				statusLabel.Text = string.format("Probing %d/%d...", i, #remotes)
+			if not player.Parent then
+				reportLine("")
+				reportLine("STOPPED: You were kicked/disconnected (anti-cheat). Partial report saved to clipboard.")
+				copyText()
+				scanRunning = false
+				flushDisplay(true)
+				return
 			end
+
+			statusLabel.Text = string.format("Probing %d/%d (wait %.1fs)...", i, #remotes, DELAY_BETWEEN_REMOTES)
 
 			local ok, result = pcall(function()
 				return probeOneRemote(remote, i)
@@ -295,13 +326,7 @@ local function main()
 
 			if not ok then
 				local path = remote:GetFullName()
-				reportLine(string.format("[%d] %s — SKIPPED (probe crashed: %s)", i, path, tostring(result)))
-				Report.allRemotes[path] = {
-					index = i,
-					path = path,
-					className = remote.ClassName,
-					status = "SKIPPED — " .. tostring(result),
-				}
+				reportLine(string.format("[%d] %s — SKIPPED (%s)", i, path, tostring(result)))
 				safeCount += 1
 			elseif result then
 				manipCount += 1
@@ -309,12 +334,22 @@ local function main()
 				safeCount += 1
 			end
 
-			if i % 15 == 0 then
+			if i % 10 == 0 or i == #remotes then
 				flushDisplay(false)
+			end
+
+			if AUTO_COPY_EVERY > 0 and i % AUTO_COPY_EVERY == 0 then
+				local copied = copyText()
+				if copied and statusLabel then
+					statusLabel.Text = string.format("Auto-saved report to clipboard (%d/%d)", i, #remotes)
+				end
+			end
+
+			if i < #remotes then
+				task.wait(DELAY_BETWEEN_REMOTES)
 			end
 		end
 
-		-- Optional custom remote
 		if pathInput and pathInput.Text ~= "" then
 			reportLine("")
 			reportLine("Custom: " .. pathInput.Text)
@@ -327,31 +362,32 @@ local function main()
 			if resolveOk and (obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction")) then
 				probeOneRemote(obj, #remotes + 1)
 			else
-				reportLine("     → NOT FOUND or not a remote")
+				reportLine("     → NOT FOUND")
 			end
 		end
 
 		reportLine("")
 		reportLine("========== SUMMARY ==========")
-		reportLine(string.format("Manipulable: %d", manipCount))
-		reportLine(string.format("Not manipulable / stopped: %d", safeCount))
+		reportLine("Manipulable: " .. manipCount)
+		reportLine("Not manipulable: " .. safeCount)
 		reportLine("")
 
 		if manipCount > 0 then
-			reportLine("========== PATCH THESE (MANIPULABLE) ==========")
+			reportLine("========== PATCH THESE ==========")
 			for path, info in pairs(Report.allRemotes) do
 				if Report.manipulable[path] then
 					reportLine("• " .. path .. " (" .. info.className .. ")")
 				end
 			end
-		else
-			reportLine("No manipulable remotes from this probe (AC may be working).")
 		end
 
 		flushDisplay(true)
+		local copied, chars = copyText()
+		statusLabel.Text = copied
+			and string.format("Done — %d manipulable. Copied %d chars.", manipCount, chars)
+			or string.format("Done — %d manipulable. Copy All if kicked.", manipCount)
 
-		local chars = #getFullReportText()
-		statusLabel.Text = string.format("Done — %d manipulable / %d total. Report %d chars. Press Copy All.", manipCount, #remotes, chars)
+		scanRunning = false
 	end
 
 	local makeBtn = mountGui()
@@ -363,7 +399,7 @@ local function main()
 	makeBtn("Copy All", 111, 95, function()
 		flushDisplay(true)
 		local copied, chars = copyText()
-		statusLabel.Text = copied and ("Copied " .. chars .. " chars.") or ("Copy failed — " .. chars .. " chars in log.")
+		statusLabel.Text = copied and ("Copied " .. chars .. " chars.") or "Copy failed."
 	end)
 
 	makeBtn("Close", 212, 70, function()
@@ -372,11 +408,7 @@ local function main()
 	end, Color3.fromRGB(80, 85, 100))
 
 	_G.__ServerExploitProbeLoaded = true
-
-	task.spawn(function()
-		task.wait(0.2)
-		runScan()
-	end)
+	-- No auto-start — you choose when to probe (less surprise kicks)
 
 	return "OK"
 end
