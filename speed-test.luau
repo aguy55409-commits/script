@@ -24,7 +24,12 @@ end
 local GUI_NAME = "SpeedExploitTest"
 local TREADMILL_PATH = "ReplicatedStorage.Remotes.TreadmillSignal"
 local CHECK_GOLD_PATH = "ReplicatedStorage.Remotes.CheckGoldTreadmill"
+local SET_SPEED_PATH = "ReplicatedStorage.Remotes.SetCustomSpeed"
 local SPEED_STAT_NAME = "Speed"
+
+local fireTouch = firetouchinterest
+		or (syn and syn.firetouchinterest)
+		or (fluxus and fluxus.firetouchinterest)
 
 local running = false
 local ticksPerBurst = 40
@@ -44,6 +49,10 @@ local bestTreadmillPayload = { label = "empty", args = {} }
 local updateSpeedHooked = false
 local lastOnTreadmill = false
 local lastDetectReason = "unknown"
+local speedRateLabel
+local baselineRate = 0
+local boostRate = 0
+local heartbeatBoostConn = nil
 
 local ATTR_NAMES = {
 	"OnTreadmill",
@@ -298,6 +307,93 @@ local function updateLiveSpeedLabel()
 	local speed = getSpeedStat()
 	local speedText = speed and ("Speed = " .. tostring(speed)) or "Speed = ?"
 	liveSpeedLabel.Text = speedText
+	if speedRateLabel then
+		speedRateLabel.Text = string.format(
+			"Gain rate: normal ~%s/s | boost ~%s/s",
+			tostring(baselineRate),
+			tostring(boostRate)
+		)
+	end
+end
+
+local function getNearestTreadmillPart()
+	local char = player.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then
+		return nil
+	end
+	local best, bestDist = nil, math.huge
+	for _, part in treadmillParts do
+		if part.Parent then
+			local d = (hrp.Position - part.Position).Magnitude
+			if d < bestDist then
+				bestDist = d
+				best = part
+			end
+		end
+	end
+	return best
+end
+
+local function snapToBelt()
+	scanTreadmills()
+	local part = getNearestTreadmillPart()
+	local char = player.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not part or not hrp then
+		log("Snap failed — no treadmill part or character.")
+		return false
+	end
+	local y = part.Size.Y / 2 + hrp.Size.Y / 2 + 0.5
+	hrp.CFrame = part.CFrame * CFrame.new(0, y, 0)
+	log("Snapped onto: " .. part:GetFullName())
+	task.wait(0.15)
+	updateTreadmillStatusUI()
+	return true
+end
+
+local function fireTouchBurst()
+	if not fireTouch then
+		return false
+	end
+	local char = player.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then
+		return false
+	end
+	local hit = 0
+	for _, part in treadmillParts do
+		if part.Parent and part.CanTouch ~= false then
+			pcall(fireTouch, part, hrp, 0)
+			pcall(fireTouch, part, hrp, 1)
+			hit += 1
+		end
+	end
+	return hit > 0
+end
+
+local function measureGainPerSecond(seconds, useBoost)
+	local s0 = parseStatNumber(getSpeedStat())
+	if not s0 then
+		return 0
+	end
+	local t0 = os.clock()
+	local remote = getTreadmillRemote()
+	local args = bestTreadmillPayload.args
+
+	while os.clock() - t0 < seconds do
+		if useBoost and remote then
+			registerWithServer()
+			fireTouchBurst()
+			pcall(fireTreadmillBurst, remote, args, 5)
+			fireRemote(SET_SPEED_PATH, { 2 })
+			fireRemote(SET_SPEED_PATH, { "2" })
+		end
+		task.wait(0.05)
+	end
+
+	local s1 = parseStatNumber(getSpeedStat()) or s0
+	return (s1 - s0) / seconds
 end
 
 local function discoverAll()
@@ -368,10 +464,21 @@ local function fireTreadmillBurst(remote, args, count)
 end
 
 local function registerWithServer()
-	-- Tell server which treadmill you're on (from your game's remotes)
 	fireRemote(CHECK_GOLD_PATH, {})
 	fireRemote(CHECK_GOLD_PATH, { true })
 	fireRemote(CHECK_GOLD_PATH, { player.UserId })
+end
+
+local function runFullBoostPacket(remote, args, multiplier)
+	registerWithServer()
+	fireTouchBurst()
+	if remote then
+		fireTreadmillBurst(remote, args, ticksPerBurst)
+	end
+	-- multiplier / boost amount (some games use SetCustomSpeed as speed mult)
+	fireRemote(SET_SPEED_PATH, { multiplier })
+	fireRemote(SET_SPEED_PATH, { tostring(multiplier) })
+	fireRemote(SET_SPEED_PATH, { "Speed", multiplier })
 end
 
 local TREADMILL_TRIALS = {
@@ -436,6 +543,41 @@ local function runProbeOnce()
 	log(string.format("Best payload: %s | Click Start", bestTrial.label))
 end
 
+local function stopHeartbeatBoost()
+	if heartbeatBoostConn then
+		heartbeatBoostConn:Disconnect()
+		heartbeatBoostConn = nil
+	end
+end
+
+local function runCompareRates()
+	log("=== RATE TEST (3 sec normal, 3 sec boost) ===")
+	log("Stay ON treadmill (green). Don't move.")
+
+	snapToBelt()
+	task.wait(0.5)
+	if not isOnTreadmill() then
+		log("Still OFF treadmill — fix position then retry.")
+		return
+	end
+
+	baselineRate = math.floor(measureGainPerSecond(3, false) + 0.5)
+	log(string.format("Normal speed gain: ~%s / second", tostring(baselineRate)))
+
+	boostRate = math.floor(measureGainPerSecond(3, true) + 0.5)
+	log(string.format("Boost speed gain: ~%s / second", tostring(boostRate)))
+
+	if boostRate <= baselineRate * 1.1 then
+		log("RESULT: Boost did NOT beat normal — server ignores client spam.")
+		log("Your anti-cheat is WORKING (server controls Speed).")
+		statusLabel.Text = "AC OK — server blocks faster ticks"
+	else
+		log(string.format("RESULT: Boost is ~%.0f%% faster — VULNERABLE", ((boostRate / math.max(baselineRate, 1)) - 1) * 100))
+		statusLabel.Text = "VULN — boost increased gain rate"
+	end
+	updateLiveSpeedLabel()
+end
+
 local function runTurboLoop()
 	if running then
 		return
@@ -448,18 +590,42 @@ local function runTurboLoop()
 	end
 
 	scanTreadmills()
+	snapToBelt()
+
 	running = true
 	ticksPerBurst = math.clamp(tonumber(ticksBox.Text) or 40, 1, 500)
 	burstDelay = math.clamp(tonumber(delayBox.Text) or 0.03, 0, 2)
+	local useMaxMode = burstDelay <= 0
 
 	hookUpdateSpeedListener()
-	log("=== TURBO START ===")
-	log(string.format("%d ticks/burst | delay %.3fs", ticksPerBurst, burstDelay))
+	log("=== BOOST START ===")
+	log("Uses: touch sim + TreadmillSignal + SetCustomSpeed mult")
+	if fireTouch then
+		log("firetouchinterest: YES")
+	else
+		log("firetouchinterest: NO (executor may not support)")
+	end
+	if useMaxMode then
+		log("MAX mode: firing every frame on Heartbeat")
+	end
 
 	local burstCount = 0
-	local totalGain = 0
 	local sessionStart = getSpeedStat()
 	local skippedOff = 0
+	local mult = 5
+
+	stopHeartbeatBoost()
+	if useMaxMode then
+		heartbeatBoostConn = RunService.Heartbeat:Connect(function()
+			if not running then
+				return
+			end
+			if requireOnTreadmill and not isOnTreadmill() then
+				return
+			end
+			runFullBoostPacket(remote, bestTreadmillPayload.args, mult)
+		end)
+	end
 
 	while running do
 		if not player.Parent then
@@ -472,44 +638,55 @@ local function runTurboLoop()
 
 		if requireOnTreadmill and not on then
 			skippedOff += 1
-			if skippedOff == 1 or skippedOff % 20 == 0 then
-				log("Waiting for treadmill... " .. reason)
-				statusLabel.Text = "Stand on treadmill! " .. reason
+			if skippedOff == 1 or skippedOff % 15 == 0 then
+				log("OFF treadmill — click Snap or step on belt")
 			end
 			task.wait(0.2)
 			continue
 		end
 
 		skippedOff = 0
-		registerWithServer()
 
-		burstCount += 1
-		local before = getSpeedStat()
+		if not useMaxMode then
+			burstCount += 1
+			local before = getSpeedStat()
+			local t0 = os.clock()
 
-		pcall(function()
-			fireTreadmillBurst(remote, bestTreadmillPayload.args, ticksPerBurst)
-		end)
+			pcall(function()
+				runFullBoostPacket(remote, bestTreadmillPayload.args, mult)
+			end)
 
-		if burstDelay > 0 then
-			task.wait(burstDelay)
+			if burstDelay > 0 then
+				task.wait(burstDelay)
+			end
+
+			local after = getSpeedStat()
+			local numDelta, deltaStr = speedDelta(before, after)
+			local elapsed = math.max(os.clock() - t0, 0.001)
+			boostRate = math.floor(((parseStatNumber(after) or 0) - (parseStatNumber(before) or 0)) / elapsed + 0.5)
+
+			if burstCount % logEveryNBursts == 0 then
+				log(string.format("burst %d | +%s/s est | Speed=%s", burstCount, tostring(boostRate), tostring(after)))
+			end
+
+			statusLabel.Text = string.format("+%s/s | Speed=%s", tostring(boostRate), tostring(after))
+			updateLiveSpeedLabel()
+		else
+			task.wait(0.5)
+			boostRate = math.floor(measureGainPerSecond(0.5, false) + 0.5)
+			statusLabel.Text = string.format("MAX frame boost | Speed=%s | ~%s/s", tostring(getSpeedStat()), tostring(boostRate))
+			updateLiveSpeedLabel()
 		end
 
-		local after = getSpeedStat()
-		local numDelta, deltaStr = speedDelta(before, after)
-		if type(numDelta) == "number" and numDelta > 0 then
-			totalGain += numDelta
-		end
-
-		if burstCount % logEveryNBursts == 0 or (numDelta and numDelta ~= 0) then
-			log(string.format("burst %d | ON | +%s | Speed=%s", burstCount, deltaStr, tostring(after)))
-		end
-
-		statusLabel.Text = string.format("ON %s | burst %d | Speed=%s", reason or "?", burstCount, tostring(after))
-		updateLiveSpeedLabel()
+		mult = math.min(mult + 1, 50)
 	end
 
+	stopHeartbeatBoost()
 	running = false
-	log(string.format("STOPPED | bursts=%d | Speed %s -> %s", burstCount, sessionStart, getSpeedStat()))
+	log(string.format("STOPPED | Speed %s -> %s", sessionStart, getSpeedStat()))
+	if boostRate <= 0 and baselineRate <= 0 then
+		log("If Speed never moved: server-only treadmill = good security.")
+	end
 	statusLabel.Text = "Stopped."
 	updateTreadmillStatusUI()
 end
@@ -535,7 +712,7 @@ end
 local panel = Instance.new("Frame")
 panel.AnchorPoint = Vector2.new(0.5, 0.5)
 panel.Position = UDim2.fromScale(0.5, 0.5)
-panel.Size = UDim2.fromOffset(430, 470)
+panel.Size = UDim2.fromOffset(430, 500)
 panel.BackgroundColor3 = Color3.fromRGB(24, 26, 34)
 panel.Parent = screenGui
 Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
@@ -578,7 +755,18 @@ statusLabel.Parent = panel
 liveSpeedLabel = Instance.new("TextLabel")
 liveSpeedLabel.BackgroundTransparency = 1
 liveSpeedLabel.Position = UDim2.fromOffset(12, 100)
-liveSpeedLabel.Size = UDim2.new(1, -24, 0, 22)
+liveSpeedLabel.Size = UDim2.new(1, -24, 0, 18)
+
+speedRateLabel = Instance.new("TextLabel")
+speedRateLabel.BackgroundTransparency = 1
+speedRateLabel.Position = UDim2.fromOffset(12, 118)
+speedRateLabel.Size = UDim2.new(1, -24, 0, 18)
+speedRateLabel.Font = Enum.Font.Code
+speedRateLabel.TextSize = 10
+speedRateLabel.TextColor3 = Color3.fromRGB(140, 200, 255)
+speedRateLabel.TextXAlignment = Enum.TextXAlignment.Left
+speedRateLabel.Text = "Gain rate: run Compare to measure"
+speedRateLabel.Parent = panel
 liveSpeedLabel.Font = Enum.Font.Code
 liveSpeedLabel.TextSize = 10
 liveSpeedLabel.TextColor3 = Color3.fromRGB(255, 220, 120)
@@ -612,12 +800,12 @@ local function numBox(label, y, default)
 	return b
 end
 
-ticksBox = numBox("Ticks/burst", 128, ticksPerBurst)
-delayBox = numBox("Burst delay", 156, burstDelay)
+ticksBox = numBox("Ticks/burst", 140, ticksPerBurst)
+delayBox = numBox("Burst delay", 168, burstDelay)
 
 local scroll = Instance.new("ScrollingFrame")
-scroll.Position = UDim2.fromOffset(12, 188)
-scroll.Size = UDim2.new(1, -24, 1, -128)
+scroll.Position = UDim2.fromOffset(12, 200)
+scroll.Size = UDim2.new(1, -24, 1, -140)
 scroll.BackgroundColor3 = Color3.fromRGB(12, 14, 20)
 scroll.BorderSizePixel = 0
 scroll.ScrollBarThickness = 8
@@ -640,7 +828,7 @@ logLabel.Parent = scroll
 
 local function btn(text, x, w, fn, col)
 	local b = Instance.new("TextButton")
-	b.Position = UDim2.fromOffset(x, 428)
+	b.Position = UDim2.fromOffset(x, 458)
 	b.Size = UDim2.fromOffset(w, 32)
 	b.BackgroundColor3 = col or Color3.fromRGB(45, 120, 70)
 	b.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -652,23 +840,29 @@ local function btn(text, x, w, fn, col)
 	b.MouseButton1Click:Connect(fn)
 end
 
-btn("Scan", 12, 64, discoverAll, Color3.fromRGB(60, 100, 160))
-btn("Probe", 84, 64, function()
+btn("Scan", 8, 42, discoverAll, Color3.fromRGB(60, 100, 160))
+btn("Snap", 54, 42, snapToBelt, Color3.fromRGB(100, 80, 160))
+btn("Probe", 100, 42, function()
 	task.spawn(runProbeOnce)
 end, Color3.fromRGB(80, 130, 90))
-btn("Start", 156, 64, function()
+btn("Cmp", 146, 42, function()
+	task.spawn(runCompareRates)
+end, Color3.fromRGB(60, 130, 150))
+btn("Start", 192, 42, function()
 	task.spawn(runTurboLoop)
 end)
-btn("Stop", 228, 64, function()
+btn("Stop", 238, 42, function()
 	running = false
+	stopHeartbeatBoost()
 	log("Stop.")
 end, Color3.fromRGB(180, 70, 70))
-btn("Force", 300, 64, function()
+btn("Force", 284, 42, function()
 	requireOnTreadmill = not requireOnTreadmill
-	log(requireOnTreadmill and "Mode: only fire when ON treadmill" or "Mode: FORCE (fire even if off)")
+	log(requireOnTreadmill and "Must be ON treadmill" or "FORCE mode")
 end, Color3.fromRGB(120, 90, 50))
-btn("Close", 372, 48, function()
+btn("X", 330, 42, function()
 	running = false
+	stopHeartbeatBoost()
 	screenGui:Destroy()
 end, Color3.fromRGB(80, 85, 100))
 
@@ -688,5 +882,5 @@ end)
 hookUpdateSpeedListener()
 scanTreadmills()
 discoverAll()
-log("Big label = ON/OFF treadmill. Scan while standing on belt.")
-log("Force = spam even if red (testing only).")
+log("Snap = teleport onto belt. Compare = normal vs boost /s.")
+log("Burst delay 0 = MAX (every frame). If Compare says AC OK = server blocks.")
