@@ -1,8 +1,8 @@
 --[[
   SPEED EXPLOIT TEST — interacts with YOUR game's real speed stat + treadmill remote.
 
-  This game uses treadmill speed (leaderstats/attributes), NOT WalkSpeed.
-  Fires remotes, reads speed before/after, only logs when something actually changes.
+  Tracks leaderstats.Speed only (same place as Wins) — NOT custom speed UI.
+  Fires treadmill remotes, only logs when your Speed stat actually changes.
 
   loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/speed-test.luau", true))()
 ]]
@@ -34,19 +34,19 @@ local SKIP_NAME_PATTERNS = {
 	"admin",
 }
 
--- Real gameplay remotes (not gamepass prompts, not server-only sync names we skip later)
+-- Remotes that can change leaderstats.Speed (not SetCustomSpeed — that's custom input UI)
 local ACTION_REMOTES = {
-	{ name = "SetCustomSpeed", path = "ReplicatedStorage.Remotes.SetCustomSpeed" },
 	{ name = "TreadmillSignal", path = "ReplicatedStorage.Remotes.TreadmillSignal" },
 }
+
+local SPEED_STAT_NAME = "Speed"
+local WINS_STAT_NAME = "Wins"
 
 local running = false
 local startSpeed = 1000
 local stepSpeed = 10000
 local maxSpeed = 1e15
 local interval = 0.5
-local useTreadmill = true
-local useSetCustom = true
 
 local logLines = {}
 local statusLabel
@@ -91,99 +91,78 @@ local function resolvePath(path)
 	return obj
 end
 
--- Collect every number that might be "your speed" in this game
-local function collectSpeedSnapshot()
-	local snap = {}
-
-	local function add(key, value)
-		if type(value) == "number" then
-			snap[key] = value
-		end
-	end
-
+-- leaderstats.Speed only — same folder as leaderstats.Wins
+local function readLeaderstat(statName)
 	local ls = player:FindFirstChild("leaderstats")
-	if ls then
-		for _, child in ipairs(ls:GetChildren()) do
-			if child:IsA("NumberValue") or child:IsA("IntValue") then
-				add("leaderstats." .. child.Name, child.Value)
-			end
-		end
+	if not ls then
+		return nil, nil
 	end
-
-	for _, name in ipairs({ "Speed", "WalkSpeed", "CustomSpeed", "CurrentSpeed", "TreadmillSpeed", "MaxSpeed" }) do
-		local v = player:GetAttribute(name)
-		if v ~= nil then
-			add("attr." .. name, tonumber(v) or v)
-		end
+	local stat = ls:FindFirstChild(statName)
+	if not stat then
+		return nil, nil
 	end
-
-	for _, desc in ipairs(player:GetDescendants()) do
-		if desc:IsA("NumberValue") or desc:IsA("IntValue") then
-			local n = string.lower(desc.Name)
-			if string.find(n, "speed", 1, true) or n == "wins" or n == "win" then
-				add(desc:GetFullName(), desc.Value)
-			end
-		end
+	if stat:IsA("NumberValue") or stat:IsA("IntValue") then
+		return stat.Value, "leaderstats." .. statName
 	end
-
-	local char = player.Character
-	if char then
-		local hum = char:FindFirstChildOfClass("Humanoid")
-		if hum then
-			add("humanoid.WalkSpeed", hum.WalkSpeed)
-		end
+	if stat:IsA("StringValue") then
+		return stat.Value, "leaderstats." .. statName
 	end
-
-	return snap
+	return nil, nil
 end
 
-local function formatSnapshot(snap)
-	local keys = {}
-	for k in pairs(snap) do
-		table.insert(keys, k)
+local function getSpeedStat()
+	local value, _ = readLeaderstat(SPEED_STAT_NAME)
+	return value
+end
+
+local function getWinsStat()
+	local value, _ = readLeaderstat(WINS_STAT_NAME)
+	return value
+end
+
+local function formatLiveStats()
+	local speed, speedKey = readLeaderstat(SPEED_STAT_NAME)
+	local wins = readLeaderstat(WINS_STAT_NAME)
+	if speed == nil then
+		return "(leaderstats.Speed not found — wait for leaderstats to load)"
 	end
-	table.sort(keys)
-	local parts = {}
-	for _, k in ipairs(keys) do
-		table.insert(parts, string.format("%s=%s", k, tostring(snap[k])))
+	local parts = { string.format("%s=%s", speedKey, tostring(speed)) }
+	if wins ~= nil then
+		table.insert(parts, string.format("leaderstats.%s=%s", WINS_STAT_NAME, tostring(wins)))
 	end
 	return table.concat(parts, " | ")
 end
 
-local function snapshotChanged(before, after)
-	for k, v in pairs(after) do
-		local prev = before[k]
-		if prev == nil or prev ~= v then
-			return true, k, prev, v
-		end
+local function speedStatChanged(before, after)
+	if before == nil and after == nil then
+		return false
 	end
-	for k, v in pairs(before) do
-		if after[k] == nil then
-			return true, k, v, nil
-		end
+	if before == nil or after == nil then
+		return true
 	end
-	return false
+	return tostring(before) ~= tostring(after)
 end
 
 local function updateLiveSpeedLabel()
 	if not liveSpeedLabel then
 		return
 	end
-	local snap = collectSpeedSnapshot()
-	liveSpeedLabel.Text = "Game state: " .. (formatSnapshot(snap) ~= "" and formatSnapshot(snap) or "(no speed stats found yet)")
+	liveSpeedLabel.Text = "Tracking: " .. formatLiveStats()
 end
 
 local function discoverSpeedStats()
 	discoveredSpeedKeys = {}
-	local snap = collectSpeedSnapshot()
-	log("=== DISCOVER (stand on treadmill if speed is 0) ===")
-	if next(snap) == nil then
-		log("No speed leaderstats/attributes found. Walk on your treadmill, then Discover again.")
+	log("=== DISCOVER (leaderstats.Speed like Wins) ===")
+	local speed = getSpeedStat()
+	if speed == nil then
+		log("leaderstats.Speed not found yet. Join game / wait for stats to load.")
 	else
-		for k, v in pairs(snap) do
-			table.insert(discoveredSpeedKeys, k)
-			log(string.format("  %s = %s", k, tostring(v)))
-		end
+		table.insert(discoveredSpeedKeys, "leaderstats.Speed")
+		log(string.format("  leaderstats.Speed = %s", tostring(speed)))
+	end
+	local wins = getWinsStat()
+	if wins ~= nil then
+		log(string.format("  leaderstats.Wins = %s (reference only, not tested)", tostring(wins)))
 	end
 	updateLiveSpeedLabel()
 end
@@ -208,21 +187,13 @@ local function hookUpdateSpeedListener()
 	end
 end
 
--- Payload shapes common in treadmill / big-number games
-local function buildPayloadTrials(speed)
-	local s = speed
-	local str = tostring(s)
-	local bigStr = string.format("%.0e", s):gsub("+", "")
+-- TreadmillSignal payloads (raises leaderstats.Speed while on treadmill)
+local function buildPayloadTrials()
 	return {
-		{ label = "number", args = { s } },
-		{ label = "string", args = { str } },
-		{ label = "scientific string", args = { bigStr } },
-		{ label = '"speed", number', args = { "speed", s } },
-		{ label = '"Speed", string', args = { "Speed", str } },
-		{ label = "number, true", args = { s, true } },
 		{ label = "empty (treadmill tick)", args = {} },
 		{ label = "true", args = { true } },
 		{ label = "1", args = { 1 } },
+		{ label = "false", args = { false } },
 	}
 end
 
@@ -243,7 +214,7 @@ local function tryRemoteWithPayload(remoteInfo, trial)
 		return false, "remote missing"
 	end
 
-	local before = collectSpeedSnapshot()
+	local before = getSpeedStat()
 	local ok, err = pcall(function()
 		fireRemote(remote, trial.args)
 	end)
@@ -252,13 +223,12 @@ local function tryRemoteWithPayload(remoteInfo, trial)
 	end
 
 	task.wait(0.2)
-	local after = collectSpeedSnapshot()
-	local changed, key, oldV, newV = snapshotChanged(before, after)
-	if changed then
+	local after = getSpeedStat()
+	if speedStatChanged(before, after) then
 		bestPayloadByRemote[remoteInfo.name] = trial
-		return true, string.format("CHANGED %s: %s -> %s (%s)", key, tostring(oldV), tostring(newV), trial.label)
+		return true, string.format("Speed %s -> %s (%s)", tostring(before), tostring(after), trial.label)
 	end
-	return false, "no change"
+	return false, "no change to leaderstats.Speed"
 end
 
 local function runProbeOnce()
@@ -266,15 +236,8 @@ local function runProbeOnce()
 	hookUpdateSpeedListener()
 
 	for _, info in ipairs(ACTION_REMOTES) do
-		if info.name == "TreadmillSignal" and not useTreadmill then
-			continue
-		end
-		if info.name == "SetCustomSpeed" and not useSetCustom then
-			continue
-		end
-
 		log("Probing " .. info.name .. "...")
-		for _, trial in ipairs(buildPayloadTrials(startSpeed)) do
+		for _, trial in ipairs(buildPayloadTrials()) do
 			local ok, msg = tryRemoteWithPayload(info, trial)
 			if ok then
 				log("  OK " .. info.name .. " via " .. trial.label .. " — " .. msg)
@@ -302,9 +265,8 @@ local function runSpeedLoop()
 
 	hookUpdateSpeedListener()
 	log("=== LOOP START ===")
-	log("Using remotes that actually move your speed stat (not gamepass, not WalkSpeed-only).")
+	log("Loop: TreadmillSignal — watching leaderstats.Speed only.")
 
-	local speed = startSpeed
 	local tickCount = 0
 
 	while running do
@@ -314,60 +276,32 @@ local function runSpeedLoop()
 		end
 
 		tickCount += 1
-		local before = collectSpeedSnapshot()
-		log(string.format("--- tick %d | sending %s ---", tickCount, speed))
+		local before = getSpeedStat()
+		log(string.format("--- tick %d | leaderstats.Speed = %s ---", tickCount, tostring(before)))
 
 		local anyEffect = false
 
 		for _, info in ipairs(ACTION_REMOTES) do
-			if info.name == "TreadmillSignal" and not useTreadmill then
-				continue
-			end
-			if info.name == "SetCustomSpeed" and not useSetCustom then
-				continue
-			end
-
 			local trials = {}
 			local saved = bestPayloadByRemote[info.name]
 			if saved then
 				table.insert(trials, saved)
 			else
-				-- default: number for SetCustomSpeed, empty/true for treadmill ticks
-				if info.name == "TreadmillSignal" then
-					table.insert(trials, { label = "treadmill tick", args = {} })
-					table.insert(trials, { label = "true", args = { true } })
-				else
-					table.insert(trials, { label = "number", args = { speed } })
-					table.insert(trials, { label = "string", args = { tostring(speed) } })
-				end
+				table.insert(trials, { label = "treadmill tick", args = {} })
+				table.insert(trials, { label = "true", args = { true } })
 			end
 
 			for _, trial in ipairs(trials) do
-				local args = trial.args
-				if info.name == "SetCustomSpeed" and trial.label ~= "empty (treadmill tick)" and trial.label ~= "true" and trial.label ~= "1" then
-					-- replace speed in first numeric/string slot
-					if #args >= 1 and type(args[1]) == "number" then
-						args = { speed, select(2, table.unpack(args)) }
-					elseif #args >= 2 and type(args[2]) == "number" then
-						args = { args[1], speed }
-					elseif #args == 1 and type(args[1]) == "string" and args[1] ~= "speed" and args[1] ~= "Speed" then
-						args = { tostring(speed) }
-					elseif #args == 2 and (args[1] == "speed" or args[1] == "Speed") then
-						args = { args[1], speed }
-					end
-				end
-
 				local ok, msg = pcall(function()
 					local remote = resolvePath(info.path)
-					fireRemote(remote, args)
+					fireRemote(remote, trial.args)
 				end)
 				if ok then
 					task.wait(0.15)
-					local after = collectSpeedSnapshot()
-					local changed, key, oldV, newV = snapshotChanged(before, after)
-					if changed then
+					local after = getSpeedStat()
+					if speedStatChanged(before, after) then
 						anyEffect = true
-						log(string.format("  %s(%s) -> %s %s->%s", info.name, trial.label or "?", key, oldV, newV))
+						log(string.format("  %s(%s) Speed %s -> %s", info.name, trial.label or "?", before, after))
 						before = after
 					end
 				else
@@ -377,13 +311,12 @@ local function runSpeedLoop()
 		end
 
 		if not anyEffect then
-			log("  NO EFFECT this tick — wrong args or server blocked. Try Probe, or stand on treadmill.")
+			log("  NO CHANGE to leaderstats.Speed — stand on treadmill or server blocked.")
 		end
 
-		statusLabel.Text = string.format("Tick %d | target %s | %s", tickCount, speed, anyEffect and "CHANGED" or "no change")
+		statusLabel.Text = string.format("Tick %d | Speed=%s | %s", tickCount, tostring(before), anyEffect and "CHANGED" or "no change")
 		updateLiveSpeedLabel()
 
-		speed = math.min(speed + stepSpeed, maxSpeed)
 		task.wait(interval)
 	end
 
@@ -426,7 +359,7 @@ title.Font = Enum.Font.GothamBold
 title.TextSize = 16
 title.TextColor3 = Color3.fromRGB(255, 255, 255)
 title.TextXAlignment = Enum.TextXAlignment.Left
-title.Text = "Speed Exploit Test (real stats)"
+title.Text = "Speed Test (leaderstats.Speed)"
 title.Parent = panel
 
 statusLabel = Instance.new("TextLabel")
@@ -438,7 +371,7 @@ statusLabel.TextSize = 11
 statusLabel.TextWrapped = true
 statusLabel.TextColor3 = Color3.fromRGB(160, 210, 255)
 statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-statusLabel.Text = "Reads leaderstats/attributes — only logs when speed actually changes."
+statusLabel.Text = "Only tracks leaderstats.Speed (like Wins). Ignores custom speed."
 statusLabel.Parent = panel
 
 liveSpeedLabel = Instance.new("TextLabel")
@@ -545,6 +478,6 @@ end)
 
 hookUpdateSpeedListener()
 discoverSpeedStats()
-log("Targets: SetCustomSpeed + TreadmillSignal (treadmill gameplay).")
-log("UpdateSpeed is listen-only (server pushes speed to you).")
-log("1) Stand on treadmill  2) Discover  3) Probe  4) Start loop")
+log("Stat: leaderstats.Speed (NOT SetCustomSpeed / custom UI).")
+log("Remote: TreadmillSignal while on treadmill.")
+log("1) Stand on treadmill  2) Discover  3) Probe  4) Start")
