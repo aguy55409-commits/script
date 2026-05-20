@@ -1,9 +1,0 @@
-{
-  "name": "script",
-  "tree": {
-    "$className": "DataModel",
-    "ServerScriptService": {
-      "$path": "src/ServerScriptService"
-    }
-  }
-}

@@ -1,10 +1,31 @@
--- Server-owned popup GUI. The server creates the UI in PlayerGui and handles all clicks.
+--[[
+  SERVER POPUP GUI — single file, run as-is
+
+  Studio (your game):
+    1. View → Command Bar
+    2. Switch to SERVER (not Client)
+    3. Paste this entire file and press Enter — GUI shows right away
+
+  Or: ServerScriptService → Insert Script → paste this file → Play
+
+  Inject (your own game / server-side executor):
+    Execute this script on the SERVER so buttons stay server-sided.
+]]
+
+if not game:GetService("RunService"):IsServer() then
+	warn("[ServerPopupGui] Run on SERVER only (Studio Command Bar → Server tab).")
+	return
+end
+
+if _G.__ServerPopupGuiLoaded then
+	return
+end
+_G.__ServerPopupGuiLoaded = true
 
 local Players = game:GetService("Players")
-
 local GUI_NAME = "ServerPopupGui"
 
-local function createPopupGui(player: Player): ScreenGui
+local function createPopupGui(player)
 	local screenGui = Instance.new("ScreenGui")
 	screenGui.Name = GUI_NAME
 	screenGui.ResetOnSpawn = false
@@ -137,16 +158,16 @@ local function createPopupGui(player: Player): ScreenGui
 	return screenGui
 end
 
-local function bindGui(player: Player, screenGui: ScreenGui)
-	local overlay = screenGui:WaitForChild("Overlay") :: Frame
-	local panel = overlay:WaitForChild("Panel") :: Frame
-	local status = panel:WaitForChild("Status") :: TextLabel
-	local input = panel:WaitForChild("MessageInput") :: TextBox
-	local submit = panel:WaitForChild("SubmitButton") :: TextButton
-	local close = panel:WaitForChild("CloseButton") :: TextButton
-	local reopen = screenGui:WaitForChild("ReopenButton") :: TextButton
+local function bindGui(player, screenGui)
+	local overlay = screenGui:WaitForChild("Overlay")
+	local panel = overlay:WaitForChild("Panel")
+	local status = panel:WaitForChild("Status")
+	local input = panel:WaitForChild("MessageInput")
+	local submit = panel:WaitForChild("SubmitButton")
+	local close = panel:WaitForChild("CloseButton")
+	local reopen = screenGui:WaitForChild("ReopenButton")
 
-	local function setOpen(isOpen: boolean)
+	local function setOpen(isOpen)
 		overlay.Visible = isOpen
 		reopen.Visible = not isOpen
 	end
@@ -176,22 +197,25 @@ local function bindGui(player: Player, screenGui: ScreenGui)
 	setOpen(true)
 end
 
-local function onPlayerAdded(player: Player)
-	if not player.Character then
-		player.CharacterAdded:Wait()
-	end
-
-	local playerGui = player:WaitForChild("PlayerGui")
-	if playerGui:FindFirstChild(GUI_NAME) then
-		return
+local function giveGuiToPlayer(player)
+	local playerGui = player:FindFirstChild("PlayerGui") or player:WaitForChild("PlayerGui")
+	local existing = playerGui:FindFirstChild(GUI_NAME)
+	if existing then
+		existing:Destroy()
 	end
 
 	local screenGui = createPopupGui(player)
 	bindGui(player, screenGui)
 end
 
+-- Runs immediately when you execute this script
 for _, player in Players:GetPlayers() do
-	task.spawn(onPlayerAdded, player)
+	task.spawn(giveGuiToPlayer, player)
 end
 
-Players.PlayerAdded:Connect(onPlayerAdded)
+Players.PlayerAdded:Connect(function(player)
+	player:WaitForChild("PlayerGui")
+	giveGuiToPlayer(player)
+end)
+
+print("[ServerPopupGui] Loaded — popup should be visible now.")

@@ -1,42 +1,23 @@
-# Server Popup GUI (Luau)
+# script.luau — execute in your game
 
-A Roblox popup GUI that is **created and controlled entirely on the server**. No LocalScripts are required.
+One file. Copy the whole thing, run it on the **server**, popup shows **immediately**.
 
-## What it does
+## Roblox Studio (your place)
 
-- When a player spawns, the server builds a `ScreenGui` in their `PlayerGui`
-- **Send to Server** — reads the text box and updates the status label on the server (also prints to the output)
-- **Close** — hides the popup; a small **Open Menu** button stays so they can reopen it
-- All button handlers use `Activated` connections on the **server**
+1. Open your game in Studio and press **Play** (or Play Here).
+2. **View → Command Bar**
+3. Click **Server** (not Client) in the command bar.
+4. Open `script.luau`, copy **everything**, paste into the command bar, press **Enter**.
 
-## Setup in Roblox Studio
+The GUI should pop up right away for everyone in the server.
 
-### Option A — Rojo (recommended for this repo)
+**Permanent install:** ServerScriptService → Insert **Script** → paste `script.luau` → stop/restart play. It runs every session.
 
-1. Install [Rojo](https://rojo.space/docs/v7/installation/)
-2. Open this folder in a terminal and run:
+## Inject (your own game)
 
-   ```bash
-   rojo serve
-   ```
+Use a **server-side** run (Studio Server command bar, or an executor that runs server scripts in **your** place). Client-only inject cannot drive a true server GUI.
 
-3. In Studio: install the Rojo plugin → **Connect** → playtest
+## Buttons
 
-### Option B — Manual copy
-
-1. Open your place in Roblox Studio
-2. In **ServerScriptService**, create a **Script** named `ServerPopupGui`
-3. Paste the contents of `src/ServerScriptService/ServerPopupGui.server.luau`
-4. Playtest
-
-## Push to GitHub
-
-From this folder, after you have files to commit:
-
-```bash
-git add .
-git commit -m "Add server-side popup GUI in Luau"
-git push -u origin main
-```
-
-You will be prompted to sign in to GitHub (PAT or browser) if not already authenticated.
+- **Send to Server** — server reads your text and updates the label
+- **Close** / **Open Menu** — hide or show the popup (still server-side)
