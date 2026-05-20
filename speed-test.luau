@@ -23,7 +23,10 @@ if not player then
 end
 
 local GUI_NAME = "FakeTreadmillRakNet"
-local hasRaknet = type(raknet) == "table" and type(raknet.add_send_hook) == "function" and type(raknet.send) == "function"
+local hasRaknet = type(raknet) == "table"
+	and type(raknet.add_send_hook) == "function"
+	and type(raknet.send) == "function"
+	and type(raknet.remove_send_hook) == "function"
 
 local REMOTE_PATHS = {
 	TreadmillSignal = "ReplicatedStorage.Remotes.TreadmillSignal",
@@ -113,33 +116,52 @@ local function packetKey(packet)
 	return tostring(packet.PacketId) .. ":" .. tostring(packet.Size)
 end
 
-local function storePacket(packet)
+local function storePacket(packet, force)
 	if not packet then
 		return
 	end
+	-- Skip tiny keepalive packets; RemoteEvent payloads are usually larger
+	local size = packet.Size or 0
+	if not force and size > 0 and size < 8 then
+		return
+	end
+
 	local key = packetKey(packet)
 	for _, p in capturedPackets do
 		if p.key == key then
+			p.hits = (p.hits or 1) + 1
 			return
 		end
 	end
+
 	local data = cloneArray(packet.AsArray)
+	if not data and packet.AsBuffer and buffer and buffer.copy then
+		pcall(function()
+			local len = size > 0 and size or 64
+			local buf = buffer.create(len)
+			buffer.copy(buf, 0, packet.AsBuffer, 0, len)
+			data = buf
+		end)
+	end
 	if not data and packet.AsString and #packet.AsString > 0 then
 		data = packet.AsString
 	end
 	if not data then
 		return
 	end
+
 	table.insert(capturedPackets, {
 		key = key,
 		data = data,
+		isBuffer = type(data) ~= "table" and type(data) ~= "string",
 		priority = packet.Priority or 1,
 		reliability = packet.Reliability or 0,
 		ordering = packet.OrderingChannel or 0,
 		packetId = packet.PacketId,
-		size = packet.Size,
+		size = size,
+		hits = 1,
 	})
-	if #capturedPackets > 40 then
+	if #capturedPackets > 60 then
 		table.remove(capturedPackets, 1)
 	end
 end
@@ -150,11 +172,13 @@ local function setupRaknetHook()
 	end
 	sendHookFn = function(packet)
 		if recording or os.clock() < captureUntil then
-			storePacket(packet)
+			storePacket(packet, false)
 		end
 	end
-	raknet.add_send_hook(sendHookFn)
-	log("RakNet send hook active.")
+	pcall(function()
+		raknet.add_send_hook(sendHookFn)
+	end)
+	log("RakNet hook: add_send_hook + send() ready.")
 end
 
 local function replayPackets(count)
@@ -217,14 +241,18 @@ local function ghostTouchBelts()
 	end
 end
 
-local function stopAll()
-	running = false
-	recording = false
-	captureUntil = 0
+local function disconnectHeartbeat()
 	if heartbeatConn then
 		heartbeatConn:Disconnect()
 		heartbeatConn = nil
 	end
+end
+
+local function stopAll()
+	running = false
+	recording = false
+	captureUntil = 0
+	disconnectHeartbeat()
 end
 
 local function runRecord()
@@ -241,13 +269,22 @@ local function runRecord()
 	fakeStatusLabel.Text = "RECORDING... stand on treadmill!"
 
 	local t0 = os.clock()
+	local lastSp = getSpeed()
 	while os.clock() - t0 < 5 do
+		captureUntil = os.clock() + 0.2
 		fireRemotes()
 		ghostTouchBelts()
-		task.wait(0.15)
+		local sp = getSpeed()
+		local b, a = parseNum(lastSp), parseNum(sp)
+		if b and a and a > b then
+			log(string.format("  speed rose %s -> %s (capturing packets)", lastSp, sp))
+			lastSp = sp
+		end
+		task.wait(0.12)
 	end
 
 	recording = false
+	captureUntil = 0
 	log(string.format("Captured %d unique packets.", #capturedPackets))
 	for i, p in ipairs(capturedPackets) do
 		if i <= 6 then
@@ -282,7 +319,7 @@ local function runReplay()
 	log(string.format("Packets: %d | replay/frame: %d", #capturedPackets, replayPerFrame))
 	fakeStatusLabel.Text = "REPLAY ACTIVE — fake treadmill anywhere"
 
-	stopAll()
+	disconnectHeartbeat()
 	heartbeatConn = RunService.Heartbeat:Connect(function()
 		if not running then
 			return
@@ -462,15 +499,34 @@ btn("Stop", 164, 52, function()
 	log("Stopped.")
 	fakeStatusLabel.Text = "Stopped"
 end, Color3.fromRGB(180, 70, 70))
-btn("Fire", 220, 52, function()
-	fireRemotes()
-	log("Fired remotes once.")
+btn("Sniff", 220, 52, function()
+	if not hasRaknet then
+		log("raknet not available")
+		return
+	end
+	setupRaknetHook()
+	recording = true
+	log("Sniff 3s — move around / use treadmill...")
+	task.delay(3, function()
+		recording = false
+		log("Sniff done: " .. #capturedPackets .. " packets")
+	end)
 end, Color3.fromRGB(70, 100, 150))
-btn("X", 276, 52, function()
+btn("Clear", 276, 52, function()
+	table.clear(capturedPackets)
+	log("Cleared captured packets.")
+end, Color3.fromRGB(90, 90, 90))
+btn("X", 332, 52, function()
 	stopAll()
 	screenGui:Destroy()
 end, Color3.fromRGB(80, 85, 100))
 
-setupRaknetHook()
-log(hasRaknet and "RakNet OK — record on treadmill first!" or "WARNING: raknet not found in executor")
-log("Record = capture real packets | START = replay anywhere")
+if hasRaknet then
+	setupRaknetHook()
+	log("RakNet API: add_send_hook, send, remove_send_hook")
+	log("1) RECORD on treadmill (walk on belt 5s)")
+	log("2) START anywhere (raknet.send replay)")
+else
+	log("WARNING: type `raknet` in Potassium — library not loaded")
+	log("Enable raknet in executor or Record won't work.")
+end
