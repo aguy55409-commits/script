@@ -1,550 +1,496 @@
 --[[
-  SERVER-SIDED EXPLOIT PROBE — Potassium / client executor only
+  EXPLOIT PROBE — Potassium. Join game FIRST, then execute.
 
-  Loadstring:
-    loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/script.luau", true))()
+  loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/script.luau", true))()
+
+  If HttpGet fails, paste this whole file into Potassium instead.
 ]]
 
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
-local ServerStorage = game:GetService("ServerStorage")
-local RunService = game:GetService("RunService")
+local function main()
+	local Players = game:GetService("Players")
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	local ServerScriptService = game:GetService("ServerScriptService")
+	local ServerStorage = game:GetService("ServerStorage")
+	local RunService = game:GetService("RunService")
+	local CoreGui = game:GetService("CoreGui")
 
-if RunService:IsServer() then
-	warn("[ExploitProbe] Client-only. Execute from Potassium in-game.")
-	return
-end
-
-if _G.__ServerExploitProbeLoaded then
-	return
-end
-_G.__ServerExploitProbeLoaded = true
-
-local player = Players.LocalPlayer
-if not player then
-	warn("[ExploitProbe] Join the game first, then execute from Potassium.")
-	return
-end
-
-local GUI_NAME = "ServerExploitProbe"
-local PROBE_TAG = "__AC_PROBE__"
-local REMOTE_SCAN_CAP = 60
-
-local Report = {
-	lines = {},
-	vulnerableRemotes = {},
-	linkedScripts = {},
-}
-
-local function reportLine(text)
-	table.insert(Report.lines, text)
-	print("[ExploitProbe]", text)
-end
-
-local function linesToText()
-	return table.concat(Report.lines, "\n")
-end
-
-local function tryCall(label, fn)
-	local ok, result = pcall(fn)
-	if ok then
-		reportLine(label .. " → SENT/OK: " .. tostring(result))
-	else
-		reportLine(label .. " → BLOCKED: " .. tostring(result))
+	-- Only block pure-server context (no local player). Executors run as client.
+	if RunService:IsServer() and not Players.LocalPlayer then
+		error("Run from Potassium while you are IN the game (client), not Studio server-only.")
 	end
-	return ok, result
-end
 
-local function collectRemotes()
-	local list = {}
-	for _, inst in ipairs(game:GetDescendants()) do
-		if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") then
-			table.insert(list, inst)
-		end
+	local player = Players.LocalPlayer
+	if not player then
+		error("No LocalPlayer — you are in the menu. JOIN the game, then execute.")
 	end
-	table.sort(list, function(a, b)
-		return a:GetFullName() < b:GetFullName()
-	end)
-	return list
-end
 
-local function getReadableSource(inst)
-	if not inst:IsA("LuaSourceContainer") then
-		return nil
-	end
-	local ok, src = pcall(function()
-		return inst.Source
-	end)
-	if ok and type(src) == "string" and #src > 0 then
-		return src
-	end
-	return nil
-end
+	local GUI_NAME = "ServerExploitProbe"
+	local PROBE_TAG = "__AC_PROBE__"
+	local REMOTE_SCAN_CAP = 80
 
-local function addLinkedScript(path, reason, remotePath)
-	if Report.linkedScripts[path] then
-		return
-	end
-	Report.linkedScripts[path] = {
-		path = path,
-		reason = reason,
-		remote = remotePath,
-	}
-end
-
-local function findScriptsForRemote(remote)
-	local name = remote.Name
-	local remotePath = remote:GetFullName()
-	local patterns = {
-		name,
-		string.format('"%s"', name),
-		string.format("'%s'", name),
-		'WaitForChild("' .. name .. '")',
-		"WaitForChild('" .. name .. "')",
-	}
-
-	local parent = remote.Parent
-	if parent then
-		for _, child in ipairs(parent:GetChildren()) do
-			if child:IsA("LuaSourceContainer") then
-				addLinkedScript(child:GetFullName(), "same folder as remote", remotePath)
+	-- Remove old UI so re-execute works
+	_G.__ServerExploitProbeLoaded = nil
+	for _, root in ipairs({ CoreGui, player:FindFirstChild("PlayerGui") }) do
+		if root then
+			local old = root:FindFirstChild(GUI_NAME)
+			if old then
+				old:Destroy()
 			end
 		end
 	end
 
-	-- Client-readable scripts that mention this remote by name
-	for _, inst in ipairs(game:GetDescendants()) do
-		if inst:IsA("LuaSourceContainer") then
-			local src = getReadableSource(inst)
-			if src then
-				for _, pattern in ipairs(patterns) do
-					if string.find(src, pattern, 1, true) or string.find(src, pattern) then
-						addLinkedScript(inst:GetFullName(), "source mentions remote name", remotePath)
-						break
+	local Report = {
+		lines = {},
+		vulnerableRemotes = {},
+		linkedScripts = {},
+	}
+
+	local screenGui
+	local statusLabel
+	local reportLabel
+	local scrollFrame
+	local pathInput
+
+	local function reportLine(text)
+		table.insert(Report.lines, text)
+		print("[ExploitProbe] " .. text)
+		if reportLabel then
+			reportLabel.Text = table.concat(Report.lines, "\n")
+			if scrollFrame then
+				scrollFrame.CanvasPosition = Vector2.new(0, math.max(0, scrollFrame.AbsoluteCanvasSize.Y))
+			end
+		end
+		task.wait()
+	end
+
+	local function getGuiRoot()
+		if gethui then
+			return gethui()
+		end
+		return CoreGui
+	end
+
+	local function mountGui()
+		screenGui = Instance.new("ScreenGui")
+		screenGui.Name = GUI_NAME
+		screenGui.ResetOnSpawn = false
+		screenGui.IgnoreGuiInset = true
+		screenGui.DisplayOrder = 99999
+		screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+		local root = getGuiRoot()
+		screenGui.Parent = root
+
+		if syn and syn.protect_gui then
+			pcall(function()
+				syn.protect_gui(screenGui)
+			end)
+		end
+
+		-- Fallback if CoreGui blocked
+		if not screenGui.Parent then
+			screenGui.Parent = player:WaitForChild("PlayerGui")
+		end
+
+		local panel = Instance.new("Frame")
+		panel.Name = "Panel"
+		panel.AnchorPoint = Vector2.new(0.5, 0.5)
+		panel.Position = UDim2.fromScale(0.5, 0.5)
+		panel.Size = UDim2.fromOffset(520, 500)
+		panel.BackgroundColor3 = Color3.fromRGB(22, 24, 32)
+		panel.BorderSizePixel = 0
+		panel.Parent = screenGui
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 10)
+		corner.Parent = panel
+
+		local title = Instance.new("TextLabel")
+		title.BackgroundTransparency = 1
+		title.Position = UDim2.fromOffset(12, 8)
+		title.Size = UDim2.new(1, -24, 0, 24)
+		title.Font = Enum.Font.GothamBold
+		title.TextSize = 18
+		title.TextColor3 = Color3.fromRGB(255, 255, 255)
+		title.TextXAlignment = Enum.TextXAlignment.Left
+		title.Text = "Exploit Probe — WORKING"
+		title.Parent = panel
+
+		statusLabel = Instance.new("TextLabel")
+		statusLabel.BackgroundTransparency = 1
+		statusLabel.Position = UDim2.fromOffset(12, 34)
+		statusLabel.Size = UDim2.new(1, -24, 0, 36)
+		statusLabel.Font = Enum.Font.Gotham
+		statusLabel.TextSize = 13
+		statusLabel.TextWrapped = true
+		statusLabel.TextColor3 = Color3.fromRGB(160, 210, 255)
+		statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+		statusLabel.Text = "GUI loaded. Scan starting automatically..."
+		statusLabel.Parent = panel
+
+		pathInput = Instance.new("TextBox")
+		pathInput.Position = UDim2.fromOffset(12, 74)
+		pathInput.Size = UDim2.new(1, -24, 0, 28)
+		pathInput.BackgroundColor3 = Color3.fromRGB(12, 14, 20)
+		pathInput.TextColor3 = Color3.fromRGB(255, 255, 255)
+		pathInput.PlaceholderText = "Optional remote: ReplicatedStorage.Remotes.Shop"
+		pathInput.PlaceholderColor3 = Color3.fromRGB(100, 105, 120)
+		pathInput.Font = Enum.Font.Code
+		pathInput.TextSize = 12
+		pathInput.Text = ""
+		pathInput.ClearTextOnFocus = false
+		pathInput.Parent = panel
+
+		local pathCorner = Instance.new("UICorner")
+		pathCorner.CornerRadius = UDim.new(0, 6)
+		pathCorner.Parent = pathInput
+
+		scrollFrame = Instance.new("ScrollingFrame")
+		scrollFrame.Position = UDim2.fromOffset(12, 110)
+		scrollFrame.Size = UDim2.new(1, -24, 1, -158)
+		scrollFrame.BackgroundColor3 = Color3.fromRGB(10, 12, 18)
+		scrollFrame.BorderSizePixel = 0
+		scrollFrame.ScrollBarThickness = 8
+		scrollFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+		scrollFrame.Parent = panel
+
+		local scrollCorner = Instance.new("UICorner")
+		scrollCorner.CornerRadius = UDim.new(0, 6)
+		scrollCorner.Parent = scrollFrame
+
+		reportLabel = Instance.new("TextLabel")
+		reportLabel.BackgroundTransparency = 1
+		reportLabel.Size = UDim2.new(1, -12, 0, 0)
+		reportLabel.Position = UDim2.fromOffset(6, 6)
+		reportLabel.Font = Enum.Font.Code
+		reportLabel.TextSize = 11
+		reportLabel.TextColor3 = Color3.fromRGB(200, 210, 225)
+		reportLabel.TextXAlignment = Enum.TextXAlignment.Left
+		reportLabel.TextYAlignment = Enum.TextYAlignment.Top
+		reportLabel.TextWrapped = true
+		reportLabel.Text = "Loading..."
+		reportLabel.AutomaticSize = Enum.AutomaticSize.Y
+		reportLabel.Parent = scrollFrame
+
+		reportLabel:GetPropertyChangedSignal("TextBounds"):Connect(function()
+			scrollFrame.CanvasSize = UDim2.fromOffset(0, reportLabel.TextBounds.Y + 16)
+		end)
+
+		local function btn(text, x, w, fn, col)
+			local b = Instance.new("TextButton")
+			b.Position = UDim2.fromOffset(x, 458)
+			b.Size = UDim2.fromOffset(w, 32)
+			b.BackgroundColor3 = col or Color3.fromRGB(45, 100, 220)
+			b.TextColor3 = Color3.fromRGB(255, 255, 255)
+			b.Font = Enum.Font.GothamBold
+			b.TextSize = 12
+			b.Text = text
+			b.Parent = panel
+			local c = Instance.new("UICorner")
+			c.CornerRadius = UDim.new(0, 6)
+			c.Parent = b
+			b.MouseButton1Click:Connect(fn)
+		end
+
+		return btn
+	end
+
+	local function copyText()
+		local text = table.concat(Report.lines, "\n")
+		if text == "" then
+			return false
+		end
+		if setclipboard then
+			local ok = pcall(function()
+				setclipboard(text)
+			end)
+			if ok then
+				return true
+			end
+		end
+		if toclipboard then
+			local ok = pcall(function()
+				toclipboard(text)
+			end)
+			if ok then
+				return true
+			end
+		end
+		return false
+	end
+
+	local function collectRemotes()
+		local list = {}
+		local ok, err = pcall(function()
+			for _, inst in ipairs(game:GetDescendants()) do
+				if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") then
+					table.insert(list, inst)
+				end
+			end
+		end)
+		if not ok then
+			reportLine("ERROR collecting remotes: " .. tostring(err))
+		end
+		table.sort(list, function(a, b)
+			return a:GetFullName() < b:GetFullName()
+		end)
+		return list
+	end
+
+	local function linkScriptsOnce()
+		reportLine("")
+		reportLine("Scanning client-readable scripts (one pass)...")
+
+		local scanRoots = {
+			ReplicatedStorage,
+			game:GetService("StarterGui"),
+			game:GetService("StarterPack"),
+			game:GetService("Workspace"),
+		}
+
+		local remoteNames = {}
+		for path, info in pairs(Report.vulnerableRemotes) do
+			local name = path:match("%.([^%.]+)$")
+			if name then
+				remoteNames[name] = path
+			end
+		end
+
+		for _, root in ipairs(scanRoots) do
+			if root then
+				for _, inst in ipairs(root:GetDescendants()) do
+					if inst:IsA("LuaSourceContainer") then
+						local ok, src = pcall(function()
+							return inst.Source
+						end)
+						if ok and type(src) == "string" and #src > 0 then
+							for name, remotePath in pairs(remoteNames) do
+								if string.find(src, name, 1, true) then
+									local spath = inst:GetFullName()
+									if not Report.linkedScripts[spath] then
+										Report.linkedScripts[spath] = {
+											path = spath,
+											reason = "mentions " .. name,
+											remote = remotePath,
+										}
+										reportLine("Linked script: " .. spath)
+									end
+								end
+							end
+						end
 					end
 				end
 			end
 		end
 	end
-end
 
-local function addVulnerableRemote(remote, detail)
-	local path = remote:GetFullName()
-	if Report.vulnerableRemotes[path] then
-		return
-	end
-	Report.vulnerableRemotes[path] = {
-		path = path,
-		className = remote.ClassName,
-		detail = detail,
-	}
-	findScriptsForRemote(remote)
-end
-
-local function appendVulnerabilitySection()
-	reportLine("")
-	reportLine("========== VULNERABLE REMOTES (PATCH SERVER HANDLERS) ==========")
-
-	local count = 0
-	for path, info in pairs(Report.vulnerableRemotes) do
-		count += 1
-		reportLine(string.format("[%d] %s (%s)", count, path, info.className))
-		reportLine("     Why: " .. info.detail)
-		reportLine("     Studio: search for '" .. path:match("%.([^%.]+)$") .. "' in ServerScriptService / ServerStorage")
-	end
-
-	if count == 0 then
-		reportLine("None flagged — remotes blocked or AC kicked before log updated.")
-	end
-
-	reportLine("")
-	reportLine("========== LINKED SCRIPTS (CLIENT-READABLE — CHECK IN STUDIO) ==========")
-
-	local scriptCount = 0
-	for path, info in pairs(Report.linkedScripts) do
-		scriptCount += 1
-		reportLine(string.format("[%d] %s", scriptCount, path))
-		reportLine("     Reason: " .. info.reason)
-		reportLine("     Remote: " .. info.remote)
-	end
-
-	if scriptCount == 0 then
-		reportLine("No client-readable scripts found. In Studio, Ctrl+Shift+F search the remote names above.")
-	end
-
-	reportLine("")
-	reportLine("========== PATCH CHECKLIST ==========")
-	reportLine("• Server: validate player, rate-limit, whitelist args on every OnServerEvent/InvokeServer")
-	reportLine("• Never trust client-created instances in ReplicatedStorage")
-	reportLine("• Block/kick on PROBE_TAG or unknown payloads if you saw SENT/OK above")
-	reportLine("• ServerScriptService / ServerStorage should reject client parenting")
-	reportLine("• Re-run probe after patching; vulnerable list should shrink")
-end
-
--- === probes ===
-
-local function probeClientRemote()
-	tryCall("Create client RemoteEvent + FireServer", function()
-		local folder = Instance.new("Folder")
-		folder.Name = "ExploitProbe_ClientRemotes"
-		folder.Parent = ReplicatedStorage
-		local ev = Instance.new("RemoteEvent")
-		ev.Name = "ProbeEvent"
-		ev.Parent = folder
-		ev:FireServer(PROBE_TAG, "client_created_remote")
-		task.wait(0.12)
-		folder:Destroy()
-		return "client remote fired (server should ignore client-created remotes)"
-	end)
-end
-
-local function probeSSSInject()
-	local ok, result = tryCall("Inject Script into ServerScriptService", function()
-		local s = Instance.new("Script")
-		s.Name = "ExploitProbe_Injected"
-		s.Source = 'warn("SSS inject not blocked")'
-		s.Parent = ServerScriptService
-		task.wait(0.12)
-		local stillThere = ServerScriptService:FindFirstChild("ExploitProbe_Injected")
-		if stillThere then
-			stillThere:Destroy()
-			return "script stayed in SSS"
-		end
-		return "script not on server"
-	end)
-	if ok and string.find(tostring(result), "stayed", 1, true) then
-		reportLine("VULNERABLE: Client can parent Scripts into ServerScriptService")
-		addLinkedScript("ServerScriptService", "SSS inject succeeded — audit all ServerScriptService children", "N/A")
-	end
-end
-
-local function probeServerStorage()
-	local ok, result = tryCall("Parent part to ServerStorage", function()
-		local p = Instance.new("Part")
-		p.Name = "ExploitProbe_Part"
-		p.Parent = ServerStorage
-		task.wait(0.12)
-		local found = ServerStorage:FindFirstChild("ExploitProbe_Part")
-		if found then
-			found:Destroy()
-			return "part stayed in ServerStorage"
-		end
-		return "part not on server"
-	end)
-	if ok and string.find(tostring(result), "stayed", 1, true) then
-		reportLine("VULNERABLE: Client can write to ServerStorage")
-	end
-end
-
-local function probeInvalidArgs()
-	local remotes = collectRemotes()
-	local target = remotes[1]
-	if not target then
-		reportLine("Invalid args: no remotes in game.")
-		return
-	end
-
-	local ok = tryCall("Invalid/large args on " .. target:GetFullName(), function()
-		local junk = {}
-		for i = 1, 200 do
-			junk[i] = string.rep("x", 50)
-		end
-		if target:IsA("RemoteEvent") then
-			target:FireServer(nil, junk, math.huge)
-		else
-			target:InvokeServer(nil, junk)
-		end
-		return "junk sent"
-	end)
-	if ok then
-		addVulnerableRemote(target, "accepted invalid/large payload without error")
-	end
-end
-
-local function probeRemoteSpam()
-	local remotes = collectRemotes()
-	local target = remotes[1]
-	if not target then
-		reportLine("Remote spam: no remotes found.")
-		return
-	end
-
-	local ok = tryCall("Remote spam x30 on " .. target:GetFullName(), function()
-		for _ = 1, 30 do
-			if target:IsA("RemoteEvent") then
-				target:FireServer(PROBE_TAG, "spam")
-			else
-				pcall(function()
-					target:InvokeServer(PROBE_TAG, "spam")
-				end)
-			end
-		end
-		return "spam completed"
-	end)
-	if ok then
-		addVulnerableRemote(target, "accepted spam burst (30 fires) — add rate limits")
-	end
-end
-
-local function probeAllRemotes()
-	local remotes = collectRemotes()
-	reportLine("Scanning " .. #remotes .. " remotes (cap " .. REMOTE_SCAN_CAP .. ")...")
-
-	local fired, blocked = 0, 0
-	for i, remote in ipairs(remotes) do
-		if i > REMOTE_SCAN_CAP then
-			reportLine("Stopped at cap (" .. REMOTE_SCAN_CAP .. "). Run again or raise REMOTE_SCAN_CAP in script.")
-			break
-		end
-
+	local function addVulnerable(remote, detail)
 		local path = remote:GetFullName()
-		local ok, err = pcall(function()
-			if remote:IsA("RemoteEvent") then
-				remote:FireServer(PROBE_TAG, "probe", i, { exploit = true })
-			else
-				remote:InvokeServer(PROBE_TAG, "probe", i)
-			end
+		if not Report.vulnerableRemotes[path] then
+			Report.vulnerableRemotes[path] = {
+				path = path,
+				className = remote.ClassName,
+				detail = detail,
+			}
+		end
+	end
+
+	local function runScan()
+		Report.lines = {}
+		Report.vulnerableRemotes = {}
+		Report.linkedScripts = {}
+
+		reportLine("=== EXPLOIT PROBE ===")
+		reportLine("Player: " .. player.Name)
+		reportLine("PlaceId: " .. game.PlaceId)
+		reportLine("GUI parent: " .. screenGui.Parent:GetFullName())
+		reportLine("")
+
+		-- 1) Client remote
+		local ok1, err1 = pcall(function()
+			local f = Instance.new("Folder")
+			f.Name = "ExploitProbe_Test"
+			f.Parent = ReplicatedStorage
+			local ev = Instance.new("RemoteEvent")
+			ev.Name = "Probe"
+			ev.Parent = f
+			ev:FireServer(PROBE_TAG, "test")
+			task.wait(0.05)
+			f:Destroy()
 		end)
+		reportLine(ok1 and "Client RemoteEvent FireServer: SENT (check server ignores)" or ("Client remote: BLOCKED " .. tostring(err1)))
 
-		if ok then
-			fired += 1
-			reportLine("VULNERABLE REMOTE: " .. path .. " (" .. remote.ClassName .. ") — FireServer/InvokeServer OK")
-			addVulnerableRemote(remote, "exploit probe payload accepted (no client-side error)")
-		else
-			blocked += 1
-			reportLine("Blocked remote: " .. path .. " — " .. tostring(err))
+		-- 2) SSS
+		local ok2, res2 = pcall(function()
+			local s = Instance.new("Script")
+			s.Name = "ExploitProbe_SSS"
+			s.Source = "warn('sss')"
+			s.Parent = ServerScriptService
+			task.wait(0.08)
+			local g = ServerScriptService:FindFirstChild("ExploitProbe_SSS")
+			if g then
+				g:Destroy()
+				return "STAYED"
+			end
+			return "gone"
+		end)
+		reportLine("SSS inject: " .. tostring(res2))
+		if res2 == "STAYED" then
+			reportLine(">>> VULNERABLE: SSS inject not blocked")
 		end
-	end
 
-	reportLine(string.format("Remote scan done: %d reachable, %d blocked/error.", fired, blocked))
-end
-
-local function probeCustomRemote(path)
-	if path == "" then
-		reportLine("Custom remote: enter path in the box (e.g. ReplicatedStorage.Remotes.Shop)")
-		return
-	end
-
-	local ok, result = tryCall("Custom: " .. path, function()
-		local obj = game
-		for part in string.gmatch(path, "[^%.]+") do
-			obj = obj:WaitForChild(part, 3)
+		-- 3) ServerStorage
+		local ok3, res3 = pcall(function()
+			local p = Instance.new("Part")
+			p.Name = "ExploitProbe_P"
+			p.Parent = ServerStorage
+			task.wait(0.08)
+			local g = ServerStorage:FindFirstChild("ExploitProbe_P")
+			if g then
+				g:Destroy()
+				return "STAYED"
+			end
+			return "gone"
+		end)
+		reportLine("ServerStorage inject: " .. tostring(res3))
+		if res3 == "STAYED" then
+			reportLine(">>> VULNERABLE: ServerStorage not blocked")
 		end
-		if not obj:IsA("RemoteEvent") and not obj:IsA("RemoteFunction") then
-			error("not a RemoteEvent/RemoteFunction")
-		end
-		if obj:IsA("RemoteEvent") then
-			obj:FireServer(PROBE_TAG, "custom")
-		else
-			obj:InvokeServer(PROBE_TAG, "custom")
-		end
-		return obj.ClassName
-	end)
 
-	if ok then
-		local obj = game
-		for part in string.gmatch(path, "[^%.]+") do
-			obj = obj:FindFirstChild(part)
-			if not obj then
+		-- 4) All remotes
+		reportLine("")
+		reportLine("Firing remotes...")
+		local remotes = collectRemotes()
+		reportLine("Found " .. #remotes .. " remotes")
+
+		if #remotes == 0 then
+			reportLine("WARNING: This game has ZERO remotes. Nothing to fire.")
+			reportLine("Your game may load remotes later — re-run after joining.")
+		end
+
+		local sent, blocked = 0, 0
+		for i, remote in ipairs(remotes) do
+			if i > REMOTE_SCAN_CAP then
 				break
 			end
+			local path = remote:GetFullName()
+			local ok, err = pcall(function()
+				if remote:IsA("RemoteEvent") then
+					remote:FireServer(PROBE_TAG, "probe", i)
+				else
+					remote:InvokeServer(PROBE_TAG, "probe", i)
+				end
+			end)
+			if ok then
+				sent += 1
+				addVulnerable(remote, "FireServer/InvokeServer returned no error")
+				reportLine("REACHABLE: " .. path)
+			else
+				blocked += 1
+				reportLine("BLOCKED: " .. path .. " | " .. tostring(err))
+			end
+			if i % 5 == 0 then
+				task.wait()
+			end
 		end
-		if obj and (obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction")) then
-			addVulnerableRemote(obj, "custom probe path accepted")
+		reportLine("")
+		reportLine(string.format("Result: %d reachable, %d blocked/errors", sent, blocked))
+
+		-- 5) Custom path
+		if pathInput and pathInput.Text ~= "" then
+			local customOk, customErr = pcall(function()
+				local obj = game
+				for part in string.gmatch(pathInput.Text, "[^%.]+") do
+					obj = obj:WaitForChild(part, 2)
+				end
+				if obj:IsA("RemoteEvent") then
+					obj:FireServer(PROBE_TAG, "custom")
+				elseif obj:IsA("RemoteFunction") then
+					obj:InvokeServer(PROBE_TAG, "custom")
+				else
+					error("not a remote")
+				end
+			end)
+			if customOk then
+				reportLine("Custom OK: " .. pathInput.Text)
+			else
+				reportLine("Custom FAIL: " .. tostring(customErr))
+			end
 		end
-	end
-end
 
-local function resetReport()
-	Report.lines = {}
-	Report.vulnerableRemotes = {}
-	Report.linkedScripts = {}
-end
+		linkScriptsOnce()
 
-local function runProbes(probes, pathInput, reportBox, statusLabel)
-	resetReport()
-	reportLine("=== EXPLOIT PROBE REPORT ===")
-	reportLine("Player: " .. player.Name)
-	reportLine("PlaceId: " .. tostring(game.PlaceId))
-	reportLine("Time: " .. os.date("%Y-%m-%d %H:%M:%S"))
-	reportLine("")
+		reportLine("")
+		reportLine("========== PATCH IN STUDIO ==========")
+		local n = 0
+		for path, info in pairs(Report.vulnerableRemotes) do
+			n += 1
+			reportLine(n .. ". " .. path .. " (" .. info.className .. ")")
+			reportLine("   " .. info.detail)
+		end
+		if n == 0 then
+			reportLine("No reachable remotes OR game has no remotes yet.")
+		end
 
-	for _, probe in ipairs(probes) do
-		probe()
+		statusLabel.Text = "Scan done. " .. n .. " vulnerable remotes. Press Copy."
 	end
 
-	if pathInput and pathInput.Text ~= "" then
-		probeCustomRemote(pathInput.Text)
-	end
+	local makeBtn = mountGui()
 
-	appendVulnerabilitySection()
-	reportBox.Text = linesToText()
-	statusLabel.Text = "Done — select report or press Copy Report."
+	makeBtn("Run Scan", 10, 90, function()
+		statusLabel.Text = "Scanning..."
+		task.spawn(runScan)
+	end)
+
+	makeBtn("Copy", 108, 70, function()
+		if copyText() then
+			statusLabel.Text = "Copied to clipboard!"
+		else
+			statusLabel.Text = "Copy failed — select text in box manually."
+		end
+	end)
+
+	makeBtn("Close", 184, 70, function()
+		screenGui:Destroy()
+		_G.__ServerExploitProbeLoaded = nil
+	end, Color3.fromRGB(80, 85, 100))
+
+	_G.__ServerExploitProbeLoaded = true
+
+	-- AUTO RUN so user sees it DO something immediately
+	task.spawn(function()
+		task.wait(0.3)
+		runScan()
+	end)
+
+	return "OK"
 end
 
--- === GUI ===
-
-local playerGui = player:WaitForChild("PlayerGui")
-local old = playerGui:FindFirstChild(GUI_NAME)
-if old then
-	old:Destroy()
-end
-
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = GUI_NAME
-screenGui.ResetOnSpawn = false
-screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-screenGui.Parent = playerGui
-
-local panel = Instance.new("Frame")
-panel.AnchorPoint = Vector2.new(0.5, 0.5)
-panel.Position = UDim2.fromScale(0.5, 0.5)
-panel.Size = UDim2.fromOffset(500, 480)
-panel.BackgroundColor3 = Color3.fromRGB(28, 30, 38)
-panel.Parent = screenGui
-Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
-
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -20, 0, 28)
-title.Position = UDim2.fromOffset(10, 8)
-title.BackgroundTransparency = 1
-title.Font = Enum.Font.GothamBold
-title.TextSize = 17
-title.TextColor3 = Color3.fromRGB(255, 255, 255)
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.Text = "Server Exploit Probe"
-title.Parent = panel
-
-local status = Instance.new("TextLabel")
-status.Size = UDim2.new(1, -20, 0, 32)
-status.Position = UDim2.fromOffset(10, 36)
-status.BackgroundTransparency = 1
-status.Font = Enum.Font.Gotham
-status.TextSize = 12
-status.TextWrapped = true
-status.TextXAlignment = Enum.TextXAlignment.Left
-status.TextColor3 = Color3.fromRGB(170, 175, 190)
-status.Text = "Copyable report + vulnerable remote/script list for patching."
-status.Parent = panel
-
-local pathInput = Instance.new("TextBox")
-pathInput.Size = UDim2.new(1, -20, 0, 28)
-pathInput.Position = UDim2.fromOffset(10, 72)
-pathInput.BackgroundColor3 = Color3.fromRGB(18, 20, 26)
-pathInput.TextColor3 = Color3.fromRGB(255, 255, 255)
-pathInput.PlaceholderText = "Optional: ReplicatedStorage.Folder.RemoteName"
-pathInput.PlaceholderColor3 = Color3.fromRGB(110, 115, 130)
-pathInput.Font = Enum.Font.Code
-pathInput.TextSize = 12
-pathInput.Text = ""
-pathInput.Parent = panel
-Instance.new("UICorner", pathInput).CornerRadius = UDim.new(0, 6)
-
-local reportBox = Instance.new("TextBox")
-reportBox.Name = "ReportBox"
-reportBox.Size = UDim2.new(1, -20, 1, -150)
-reportBox.Position = UDim2.fromOffset(10, 108)
-reportBox.BackgroundColor3 = Color3.fromRGB(14, 16, 22)
-reportBox.TextColor3 = Color3.fromRGB(210, 220, 235)
-reportBox.PlaceholderText = "Press Run All — full report appears here (Ctrl+A, Ctrl+C)"
-reportBox.PlaceholderColor3 = Color3.fromRGB(90, 95, 110)
-reportBox.Font = Enum.Font.Code
-reportBox.TextSize = 11
-reportBox.TextXAlignment = Enum.TextXAlignment.Left
-reportBox.TextYAlignment = Enum.TextYAlignment.Top
-reportBox.TextWrapped = true
-reportBox.MultiLine = true
-reportBox.ClearTextOnFocus = false
-reportBox.TextEditable = true
-reportBox.Text = ""
-reportBox.Parent = panel
-Instance.new("UICorner", reportBox).CornerRadius = UDim.new(0, 6)
-
-local reportPadding = Instance.new("UIPadding")
-reportPadding.PaddingTop = UDim.new(0, 8)
-reportPadding.PaddingBottom = UDim.new(0, 8)
-reportPadding.PaddingLeft = UDim.new(0, 8)
-reportPadding.PaddingRight = UDim.new(0, 8)
-reportPadding.Parent = reportBox
-
-local function makeButton(text, x, w, callback, color)
-	local b = Instance.new("TextButton")
-	b.Size = UDim2.fromOffset(w, 30)
-	b.Position = UDim2.fromOffset(x, 438)
-	b.BackgroundColor3 = color or Color3.fromRGB(50, 90, 200)
-	b.TextColor3 = Color3.fromRGB(255, 255, 255)
-	b.Font = Enum.Font.GothamBold
-	b.TextSize = 12
-	b.Text = text
-	b.Parent = panel
-	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
-	b.Activated:Connect(callback)
-end
-
-local allProbes = {
-	probeClientRemote,
-	probeSSSInject,
-	probeServerStorage,
-	probeInvalidArgs,
-	probeRemoteSpam,
-	probeAllRemotes,
-}
-
-makeButton("Run All", 10, 88, function()
-	runProbes(allProbes, pathInput, reportBox, status)
+-- Top-level error catcher — shows why loadstring "does nothing"
+local ok, result = xpcall(main, function(err)
+	return debug.traceback(tostring(err), 2)
 end)
 
-makeButton("Scan Remotes", 104, 88, function()
-	runProbes({ probeAllRemotes }, pathInput, reportBox, status)
-end)
-
-makeButton("Copy Report", 198, 100, function()
-	local text = reportBox.Text
-	if text == "" then
-		status.Text = "Run a scan first."
-		return
+if not ok then
+	warn("[ExploitProbe] CRASHED:\n" .. tostring(result))
+	if gethui or game:GetService("CoreGui") then
+		local sg = Instance.new("ScreenGui")
+		sg.Name = "ExploitProbe_Error"
+		sg.ResetOnSpawn = false
+		sg.DisplayOrder = 99999
+		sg.Parent = gethui and gethui() or game:GetService("CoreGui")
+		local t = Instance.new("TextLabel")
+		t.Size = UDim2.fromOffset(500, 200)
+		t.Position = UDim2.fromScale(0.5, 0.5)
+		t.AnchorPoint = Vector2.new(0.5, 0.5)
+		t.BackgroundColor3 = Color3.fromRGB(40, 20, 20)
+		t.TextColor3 = Color3.fromRGB(255, 100, 100)
+		t.TextWrapped = true
+		t.Font = Enum.Font.Code
+		t.TextSize = 14
+		t.Text = "[ExploitProbe ERROR]\n" .. tostring(result)
+		t.Parent = sg
 	end
-
-	local copied = false
-	if setclipboard then
-		local ok = pcall(function()
-			setclipboard(text)
-		end)
-		copied = ok
-	end
-
-	if copied then
-		status.Text = "Copied to clipboard (Potassium/setclipboard)."
-	else
-		reportBox:CaptureFocus()
-		reportBox.SelectionStart = 1
-		reportBox.CursorPosition = #text + 1
-		status.Text = "Select all (Ctrl+A) and copy (Ctrl+C)."
-	end
-end)
-
-makeButton("Export", 304, 72, function()
-	if reportBox.Text == "" then
-		status.Text = "Nothing to export."
-		return
-	end
-	reportLine("---")
-	reportLine("END OF REPORT")
-	reportBox.Text = linesToText()
-	if setclipboard then
-		pcall(function()
-			setclipboard(reportBox.Text)
-		end)
-		status.Text = "Full report refreshed and copied if setclipboard works."
-	else
-		status.Text = "Report refreshed in box — Ctrl+A, Ctrl+C."
-	end
-end)
-
-makeButton("Close", 382, 108, function()
-	screenGui:Destroy()
-	_G.__ServerExploitProbeLoaded = nil
-end, Color3.fromRGB(70, 74, 88))
-
-print("[ExploitProbe] Ready — Run All, then Copy Report.")
+else
+	print("[ExploitProbe] Started:", result)
+end
