@@ -1,8 +1,8 @@
 --[[
-  SPEED TEST — turbo treadmill ticks -> leaderstats.Speed (like Wins).
+  TURBO TREADMILL SPEED TEST
 
-  Stand on treadmill, set Ticks/burst + Burst delay, Start.
-  Spams TreadmillSignal fast so speed climbs faster than normal.
+  Detects when you are ON a treadmill (touch / distance / game flags).
+  Then spams TreadmillSignal + CheckGoldTreadmill to speed up ticks.
 
   loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/speed-test.luau", true))()
 ]]
@@ -10,6 +10,7 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local CoreGui = game:GetService("CoreGui")
+local Workspace = game:GetService("Workspace")
 
 if RunService:IsServer() and not Players.LocalPlayer then
 	error("Run on client (Potassium) while in-game.")
@@ -22,13 +23,17 @@ end
 
 local GUI_NAME = "SpeedExploitTest"
 local TREADMILL_PATH = "ReplicatedStorage.Remotes.TreadmillSignal"
+local CHECK_GOLD_PATH = "ReplicatedStorage.Remotes.CheckGoldTreadmill"
 local SPEED_STAT_NAME = "Speed"
 
 local running = false
 local ticksPerBurst = 40
 local burstDelay = 0.03
+local requireOnTreadmill = true
 local logEveryNBursts = 5
 
+local treadmillParts = {}
+local treadmillStatusLabel
 local logLines = {}
 local statusLabel
 local liveSpeedLabel
@@ -37,7 +42,18 @@ local ticksBox
 local delayBox
 local bestTreadmillPayload = { label = "empty", args = {} }
 local updateSpeedHooked = false
-local lastLoggedSpeed = nil
+local lastOnTreadmill = false
+local lastDetectReason = "unknown"
+
+local ATTR_NAMES = {
+	"OnTreadmill",
+	"onTreadmill",
+	"Running",
+	"Treadmill",
+	"OnTreadmillBelt",
+	"IsRunning",
+	"TreadmillActive",
+}
 
 local function log(text)
 	table.insert(logLines, text)
@@ -59,6 +75,50 @@ local function resolvePath(path)
 		end
 	end
 	return obj
+end
+
+local function nameLooksLikeTreadmill(name, parentName)
+	local n = string.lower(name or "")
+	local p = string.lower(parentName or "")
+	return string.find(n, "treadmill", 1, true)
+		or string.find(n, "tread", 1, true)
+		or string.find(n, "belt", 1, true)
+		or string.find(n, "runner", 1, true)
+		or string.find(p, "treadmill", 1, true)
+		or string.find(p, "tread", 1, true)
+end
+
+local function scanTreadmills()
+	table.clear(treadmillParts)
+	local count = 0
+
+	for _, inst in Workspace:GetDescendants() do
+		if inst:IsA("BasePart") then
+			local parentName = inst.Parent and inst.Parent.Name or ""
+			if nameLooksLikeTreadmill(inst.Name, parentName) then
+				table.insert(treadmillParts, inst)
+				count += 1
+			end
+		end
+	end
+
+	-- Player plot / tagged areas (common in simulators)
+	local plotNames = { player.Name, player.DisplayName }
+	for _, plotName in ipairs(plotNames) do
+		local plot = Workspace:FindFirstChild(plotName)
+		if plot then
+			for _, inst in plot:GetDescendants() do
+				if inst:IsA("BasePart") and not table.find(treadmillParts, inst) then
+					if nameLooksLikeTreadmill(inst.Name, inst.Parent and inst.Parent.Name) then
+						table.insert(treadmillParts, inst)
+						count += 1
+					end
+				end
+			end
+		end
+	end
+
+	return count
 end
 
 local function getSpeedStat()
@@ -86,14 +146,6 @@ local function parseStatNumber(value)
 	return nil
 end
 
-local function formatLiveStats()
-	local speed = getSpeedStat()
-	if speed == nil then
-		return "leaderstats.Speed not found"
-	end
-	return "leaderstats.Speed = " .. tostring(speed)
-end
-
 local function speedDelta(before, after)
 	local b, a = parseStatNumber(before), parseStatNumber(after)
 	if b and a then
@@ -105,26 +157,174 @@ local function speedDelta(before, after)
 	return 0, "0"
 end
 
-local function updateLiveSpeedLabel(extra)
+local function checkPlayerFlags()
+	for _, name in ipairs(ATTR_NAMES) do
+		local v = player:GetAttribute(name)
+		if v == true or v == 1 or v == "true" then
+			return true, "player attr: " .. name
+		end
+	end
+
+	local char = player.Character
+	if char then
+		for _, name in ipairs(ATTR_NAMES) do
+			local v = char:GetAttribute(name)
+			if v == true or v == 1 or v == "true" then
+				return true, "character attr: " .. name
+			end
+		end
+		for _, child in char:GetDescendants() do
+			if (child:IsA("BoolValue") or child:IsA("NumberValue")) and nameLooksLikeTreadmill(child.Name, "") then
+				if child:IsA("BoolValue") and child.Value then
+					return true, "value: " .. child:GetFullName()
+				end
+				if child:IsA("NumberValue") and child.Value ~= 0 then
+					return true, "value: " .. child:GetFullName()
+				end
+			end
+		end
+	end
+
+	return false, nil
+end
+
+local function checkTouching()
+	local char = player.Character
+	if not char then
+		return false, nil
+	end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp then
+		return false, nil
+	end
+
+	local touching = hrp:GetTouchingParts()
+	for _, part in touching do
+		if nameLooksLikeTreadmill(part.Name, part.Parent and part.Parent.Name) then
+			return true, "touching: " .. part.Name
+		end
+		for _, tracked in treadmillParts do
+			if part == tracked or part:IsDescendantOf(tracked.Parent) then
+				return true, "touching tracked: " .. part.Name
+			end
+		end
+	end
+
+	-- Feet / legs sometimes touch belt instead of HRP
+	for _, limb in char:GetChildren() do
+		if limb:IsA("BasePart") and limb ~= hrp then
+			for _, part in limb:GetTouchingParts() do
+				if nameLooksLikeTreadmill(part.Name, part.Parent and part.Parent.Name) then
+					return true, "touching (limb): " .. part.Name
+				end
+			end
+		end
+	end
+
+	return false, nil
+end
+
+local function checkProximity()
+	local char = player.Character
+	if not char then
+		return false, nil
+	end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp then
+		return false, nil
+	end
+
+	local bestDist = math.huge
+	local bestPart = nil
+
+	for _, part in treadmillParts do
+		if part.Parent and part:IsDescendantOf(Workspace) then
+			local offset = hrp.Position - part.Position
+			local flatDist = Vector3.new(offset.X, 0, offset.Z).Magnitude
+			local maxFlat = math.max(part.Size.X, part.Size.Z) * 0.55 + 3
+			local yOk = math.abs(offset.Y) <= math.max(part.Size.Y, 6) + 8
+			if flatDist < maxFlat and yOk and flatDist < bestDist then
+				bestDist = flatDist
+				bestPart = part
+			end
+		end
+	end
+
+	if bestPart then
+		return true, string.format("near %s (%.1f studs)", bestPart.Name, bestDist)
+	end
+	return false, nil
+end
+
+local function isOnTreadmill()
+	local flagOk, flagReason = checkPlayerFlags()
+	if flagOk then
+		return true, flagReason
+	end
+
+	local touchOk, touchReason = checkTouching()
+	if touchOk then
+		return true, touchReason
+	end
+
+	local nearOk, nearReason = checkProximity()
+	if nearOk then
+		return true, nearReason
+	end
+
+	return false, "not on treadmill (stand on belt)"
+end
+
+local function updateTreadmillStatusUI()
+	local on, reason = isOnTreadmill()
+	lastOnTreadmill = on
+	lastDetectReason = reason or "off"
+
+	if treadmillStatusLabel then
+		if on then
+			treadmillStatusLabel.Text = "ON TREADMILL ✓  " .. reason
+			treadmillStatusLabel.TextColor3 = Color3.fromRGB(80, 255, 120)
+		else
+			treadmillStatusLabel.Text = "OFF TREADMILL ✗  " .. reason
+			treadmillStatusLabel.TextColor3 = Color3.fromRGB(255, 90, 90)
+		end
+	end
+end
+
+local function updateLiveSpeedLabel()
 	if not liveSpeedLabel then
 		return
 	end
-	local line = formatLiveStats()
-	if extra then
-		line ..= " | " .. extra
-	end
-	liveSpeedLabel.Text = line
+	local speed = getSpeedStat()
+	local speedText = speed and ("Speed = " .. tostring(speed)) or "Speed = ?"
+	liveSpeedLabel.Text = speedText
 end
 
-local function discoverSpeedStats()
-	log("=== DISCOVER ===")
-	local speed = getSpeedStat()
-	if speed == nil then
-		log("No leaderstats.Speed — join game first.")
-	else
-		log("Speed = " .. tostring(speed))
-		lastLoggedSpeed = speed
+local function discoverAll()
+	log("=== SCAN ===")
+	local n = scanTreadmills()
+	log(string.format("Found %d treadmill parts in workspace", n))
+	if n > 0 and n <= 8 then
+		for i, part in ipairs(treadmillParts) do
+			log(string.format("  [%d] %s", i, part:GetFullName()))
+		end
+	elseif n > 8 then
+		for i = 1, 5 do
+			log("  " .. treadmillParts[i]:GetFullName())
+		end
+		log(string.format("  ... +%d more", n - 5))
 	end
+
+	local speed = getSpeedStat()
+	if speed then
+		log("leaderstats.Speed = " .. tostring(speed))
+	else
+		log("leaderstats.Speed missing")
+	end
+
+	updateTreadmillStatusUI()
+	local on, reason = isOnTreadmill()
+	log(on and ("You ARE detected: " .. reason) or ("NOT detected: " .. reason))
 	updateLiveSpeedLabel()
 end
 
@@ -134,8 +334,8 @@ local function hookUpdateSpeedListener()
 	end
 	local remote = resolvePath("ReplicatedStorage.Remotes.UpdateSpeed")
 	if remote and remote:IsA("RemoteEvent") then
-		remote.OnClientEvent:Connect(function(...)
-			updateLiveSpeedLabel("server synced")
+		remote.OnClientEvent:Connect(function()
+			updateLiveSpeedLabel()
 		end)
 		updateSpeedHooked = true
 	end
@@ -143,6 +343,19 @@ end
 
 local function getTreadmillRemote()
 	return resolvePath(TREADMILL_PATH)
+end
+
+local function fireRemote(path, args)
+	local remote = resolvePath(path)
+	if not remote then
+		return false
+	end
+	if remote:IsA("RemoteEvent") then
+		remote:FireServer(table.unpack(args))
+	elseif remote:IsA("RemoteFunction") then
+		remote:InvokeServer(table.unpack(args))
+	end
+	return true
 end
 
 local function fireTreadmillBurst(remote, args, count)
@@ -154,29 +367,51 @@ local function fireTreadmillBurst(remote, args, count)
 	end
 end
 
+local function registerWithServer()
+	-- Tell server which treadmill you're on (from your game's remotes)
+	fireRemote(CHECK_GOLD_PATH, {})
+	fireRemote(CHECK_GOLD_PATH, { true })
+	fireRemote(CHECK_GOLD_PATH, { player.UserId })
+end
+
 local TREADMILL_TRIALS = {
-	{ label = "empty tick", args = {} },
+	{ label = "empty", args = {} },
 	{ label = "true", args = { true } },
+	{ label = "on true", args = { true, true } },
 	{ label = "1", args = { 1 } },
-	{ label = "tick string", args = { "tick" } },
-	{ label = "run", args = { "run" } },
+	{ label = "tick", args = { "tick" } },
 }
 
 local function runProbeOnce()
 	ticksPerBurst = math.clamp(tonumber(ticksBox.Text) or 20, 1, 200)
+	scanTreadmills()
+	updateTreadmillStatusUI()
 
-	log("=== PROBE treadmill (stand on treadmill!) ===")
+	local on, reason = isOnTreadmill()
+	if not on then
+		log("WARNING: Not on treadmill — " .. reason)
+		log("Stand on the belt, click Scan, then Probe again.")
+	end
+
+	log("=== PROBE ===")
 	local remote = getTreadmillRemote()
 	if not remote then
-		log("TreadmillSignal not found.")
+		log("TreadmillSignal missing.")
 		return
 	end
 
+	registerWithServer()
 	hookUpdateSpeedListener()
+
 	local bestGain = 0
 	local bestTrial = TREADMILL_TRIALS[1]
 
 	for _, trial in ipairs(TREADMILL_TRIALS) do
+		if not isOnTreadmill() then
+			updateTreadmillStatusUI()
+		end
+		registerWithServer()
+
 		local before = getSpeedStat()
 		local ok, err = pcall(function()
 			fireTreadmillBurst(remote, trial.args, ticksPerBurst)
@@ -187,24 +422,18 @@ local function runProbeOnce()
 			task.wait(0.35)
 			local after = getSpeedStat()
 			local numDelta = speedDelta(before, after)
-			local gain = 0
-			if type(numDelta) == "number" then
-				gain = numDelta
-			elseif numDelta == nil and before ~= after then
-				gain = 1
-			end
-			log(string.format("  %s x%d -> gain %s", trial.label, ticksPerBurst, tostring(numDelta or (before .. "->" .. after))))
+			local gain = (type(numDelta) == "number" and numDelta) or (before ~= after and 1) or 0
+			log(string.format("  %s x%d | on=%s | gain %s", trial.label, ticksPerBurst, tostring(isOnTreadmill()), tostring(numDelta or (before .. "->" .. after))))
 			if gain > bestGain then
 				bestGain = gain
 				bestTrial = trial
 			end
 		end
-		task.wait(0.15)
+		task.wait(0.12)
 	end
 
 	bestTreadmillPayload = bestTrial
-	log(string.format("Best: %s (gain %s). Hit Start.", bestTrial.label, tostring(bestGain)))
-	updateLiveSpeedLabel("probe: " .. bestTrial.label)
+	log(string.format("Best payload: %s | Click Start", bestTrial.label))
 end
 
 local function runTurboLoop()
@@ -218,18 +447,19 @@ local function runTurboLoop()
 		return
 	end
 
+	scanTreadmills()
 	running = true
 	ticksPerBurst = math.clamp(tonumber(ticksBox.Text) or 40, 1, 500)
 	burstDelay = math.clamp(tonumber(delayBox.Text) or 0.03, 0, 2)
 
 	hookUpdateSpeedListener()
-	log("=== TURBO TREADMILL ===")
-	log(string.format("%d ticks/burst | %.3fs between bursts", ticksPerBurst, burstDelay))
-	log("STAND ON TREADMILL. Watching leaderstats.Speed.")
+	log("=== TURBO START ===")
+	log(string.format("%d ticks/burst | delay %.3fs", ticksPerBurst, burstDelay))
 
 	local burstCount = 0
 	local totalGain = 0
 	local sessionStart = getSpeedStat()
+	local skippedOff = 0
 
 	while running do
 		if not player.Parent then
@@ -237,17 +467,28 @@ local function runTurboLoop()
 			break
 		end
 
+		updateTreadmillStatusUI()
+		local on, reason = isOnTreadmill()
+
+		if requireOnTreadmill and not on then
+			skippedOff += 1
+			if skippedOff == 1 or skippedOff % 20 == 0 then
+				log("Waiting for treadmill... " .. reason)
+				statusLabel.Text = "Stand on treadmill! " .. reason
+			end
+			task.wait(0.2)
+			continue
+		end
+
+		skippedOff = 0
+		registerWithServer()
+
 		burstCount += 1
 		local before = getSpeedStat()
 
-		local ok, err = pcall(function()
+		pcall(function()
 			fireTreadmillBurst(remote, bestTreadmillPayload.args, ticksPerBurst)
 		end)
-
-		if not ok then
-			log("Burst error: " .. tostring(err))
-			break
-		end
 
 		if burstDelay > 0 then
 			task.wait(burstDelay)
@@ -255,39 +496,22 @@ local function runTurboLoop()
 
 		local after = getSpeedStat()
 		local numDelta, deltaStr = speedDelta(before, after)
-
 		if type(numDelta) == "number" and numDelta > 0 then
 			totalGain += numDelta
 		end
 
 		if burstCount % logEveryNBursts == 0 or (numDelta and numDelta ~= 0) then
-			local rate = ""
-			if type(numDelta) == "number" and burstDelay > 0 then
-				rate = string.format(" (~%.0f/s)", numDelta / burstDelay)
-			end
-			log(string.format("burst %d | +%s | Speed=%s%s", burstCount, deltaStr, tostring(after), rate))
-			lastLoggedSpeed = after
+			log(string.format("burst %d | ON | +%s | Speed=%s", burstCount, deltaStr, tostring(after)))
 		end
 
-		statusLabel.Text = string.format(
-			"Turbo x%d | burst %d | Speed=%s | +%s total",
-			ticksPerBurst,
-			burstCount,
-			tostring(after),
-			tostring(totalGain)
-		)
-		updateLiveSpeedLabel(string.format("+%s last burst", deltaStr))
-
-		-- No gain for many bursts = probably not on treadmill or server blocking
-		if burstCount == 10 and totalGain == 0 and sessionStart == after then
-			log("WARN: Speed not moving — are you ON the treadmill?")
-		end
+		statusLabel.Text = string.format("ON %s | burst %d | Speed=%s", reason or "?", burstCount, tostring(after))
+		updateLiveSpeedLabel()
 	end
 
 	running = false
-	local finalSpeed = getSpeedStat()
-	log(string.format("=== STOPPED | %d bursts | Speed %s -> %s ===", burstCount, tostring(sessionStart), tostring(finalSpeed)))
+	log(string.format("STOPPED | bursts=%d | Speed %s -> %s", burstCount, sessionStart, getSpeedStat()))
 	statusLabel.Text = "Stopped."
+	updateTreadmillStatusUI()
 end
 
 -- === GUI ===
@@ -311,7 +535,7 @@ end
 local panel = Instance.new("Frame")
 panel.AnchorPoint = Vector2.new(0.5, 0.5)
 panel.Position = UDim2.fromScale(0.5, 0.5)
-panel.Size = UDim2.fromOffset(420, 440)
+panel.Size = UDim2.fromOffset(430, 470)
 panel.BackgroundColor3 = Color3.fromRGB(24, 26, 34)
 panel.Parent = screenGui
 Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
@@ -327,25 +551,36 @@ title.TextXAlignment = Enum.TextXAlignment.Left
 title.Text = "Turbo Treadmill Speed Test"
 title.Parent = panel
 
+treadmillStatusLabel = Instance.new("TextLabel")
+treadmillStatusLabel.BackgroundColor3 = Color3.fromRGB(18, 20, 28)
+treadmillStatusLabel.Position = UDim2.fromOffset(12, 32)
+treadmillStatusLabel.Size = UDim2.new(1, -24, 0, 36)
+treadmillStatusLabel.Font = Enum.Font.GothamBold
+treadmillStatusLabel.TextSize = 13
+treadmillStatusLabel.TextWrapped = true
+treadmillStatusLabel.TextColor3 = Color3.fromRGB(255, 90, 90)
+treadmillStatusLabel.Text = "Scanning..."
+treadmillStatusLabel.Parent = panel
+Instance.new("UICorner", treadmillStatusLabel).CornerRadius = UDim.new(0, 6)
+
 statusLabel = Instance.new("TextLabel")
 statusLabel.BackgroundTransparency = 1
-statusLabel.Position = UDim2.fromOffset(12, 32)
-statusLabel.Size = UDim2.new(1, -24, 0, 40)
+statusLabel.Position = UDim2.fromOffset(12, 72)
+statusLabel.Size = UDim2.new(1, -24, 0, 28)
 statusLabel.Font = Enum.Font.Gotham
-statusLabel.TextSize = 11
+statusLabel.TextSize = 10
 statusLabel.TextWrapped = true
 statusLabel.TextColor3 = Color3.fromRGB(160, 210, 255)
 statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-statusLabel.Text = "Spam TreadmillSignal bursts — must stand on treadmill."
+statusLabel.Text = "Green = on treadmill. Red = step onto belt."
 statusLabel.Parent = panel
 
 liveSpeedLabel = Instance.new("TextLabel")
 liveSpeedLabel.BackgroundTransparency = 1
-liveSpeedLabel.Position = UDim2.fromOffset(12, 72)
-liveSpeedLabel.Size = UDim2.new(1, -24, 0, 32)
+liveSpeedLabel.Position = UDim2.fromOffset(12, 100)
+liveSpeedLabel.Size = UDim2.new(1, -24, 0, 22)
 liveSpeedLabel.Font = Enum.Font.Code
 liveSpeedLabel.TextSize = 10
-liveSpeedLabel.TextWrapped = true
 liveSpeedLabel.TextColor3 = Color3.fromRGB(255, 220, 120)
 liveSpeedLabel.TextXAlignment = Enum.TextXAlignment.Left
 liveSpeedLabel.Text = "..."
@@ -365,7 +600,7 @@ local function numBox(label, y, default)
 
 	local b = Instance.new("TextBox")
 	b.Position = UDim2.fromOffset(150, y - 2)
-	b.Size = UDim2.fromOffset(258, 24)
+	b.Size = UDim2.fromOffset(268, 24)
 	b.BackgroundColor3 = Color3.fromRGB(14, 16, 22)
 	b.TextColor3 = Color3.fromRGB(255, 255, 255)
 	b.Font = Enum.Font.Code
@@ -377,12 +612,12 @@ local function numBox(label, y, default)
 	return b
 end
 
-ticksBox = numBox("Ticks/burst", 108, ticksPerBurst)
-delayBox = numBox("Burst delay", 136, burstDelay)
+ticksBox = numBox("Ticks/burst", 128, ticksPerBurst)
+delayBox = numBox("Burst delay", 156, burstDelay)
 
 local scroll = Instance.new("ScrollingFrame")
-scroll.Position = UDim2.fromOffset(12, 168)
-scroll.Size = UDim2.new(1, -24, 1, -108)
+scroll.Position = UDim2.fromOffset(12, 188)
+scroll.Size = UDim2.new(1, -24, 1, -128)
 scroll.BackgroundColor3 = Color3.fromRGB(12, 14, 20)
 scroll.BorderSizePixel = 0
 scroll.ScrollBarThickness = 8
@@ -405,7 +640,7 @@ logLabel.Parent = scroll
 
 local function btn(text, x, w, fn, col)
 	local b = Instance.new("TextButton")
-	b.Position = UDim2.fromOffset(x, 398)
+	b.Position = UDim2.fromOffset(x, 428)
 	b.Size = UDim2.fromOffset(w, 32)
 	b.BackgroundColor3 = col or Color3.fromRGB(45, 120, 70)
 	b.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -417,31 +652,41 @@ local function btn(text, x, w, fn, col)
 	b.MouseButton1Click:Connect(fn)
 end
 
-btn("Discover", 12, 72, discoverSpeedStats, Color3.fromRGB(60, 100, 160))
-btn("Probe", 92, 72, function()
+btn("Scan", 12, 64, discoverAll, Color3.fromRGB(60, 100, 160))
+btn("Probe", 84, 64, function()
 	task.spawn(runProbeOnce)
 end, Color3.fromRGB(80, 130, 90))
-btn("Start", 172, 72, function()
+btn("Start", 156, 64, function()
 	task.spawn(runTurboLoop)
 end)
-btn("Stop", 252, 72, function()
+btn("Stop", 228, 64, function()
 	running = false
 	log("Stop.")
 end, Color3.fromRGB(180, 70, 70))
-btn("Close", 332, 72, function()
+btn("Force", 300, 64, function()
+	requireOnTreadmill = not requireOnTreadmill
+	log(requireOnTreadmill and "Mode: only fire when ON treadmill" or "Mode: FORCE (fire even if off)")
+end, Color3.fromRGB(120, 90, 50))
+btn("Close", 372, 48, function()
 	running = false
 	screenGui:Destroy()
 end, Color3.fromRGB(80, 85, 100))
 
+RunService.Heartbeat:Connect(function()
+	if screenGui.Parent then
+		updateTreadmillStatusUI()
+	end
+end)
+
 task.spawn(function()
 	while screenGui.Parent do
 		updateLiveSpeedLabel()
-		task.wait(0.25)
+		task.wait(0.3)
 	end
 end)
 
 hookUpdateSpeedListener()
-discoverSpeedStats()
-log("Turbo = many TreadmillSignal fires per burst.")
-log("Try: Ticks/burst 50-100, Burst delay 0.01-0.03")
-log("Stand on treadmill -> Probe -> Start")
+scanTreadmills()
+discoverAll()
+log("Big label = ON/OFF treadmill. Scan while standing on belt.")
+log("Force = spam even if red (testing only).")
