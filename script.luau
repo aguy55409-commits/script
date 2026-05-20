@@ -1,8 +1,8 @@
 --[[
   REMOTE MANIPULATION PROBE — Potassium, in-game only.
 
-  Kicked at the end? That's YOUR anti-cheat — not this script.
-  It fires many remotes quickly; AC often kicks after the batch finishes.
+  Kicked when the scan FINISHES? That's your anti-cheat punishing the whole batch
+  (delayed kick) — NOT one bad remote. Report is auto-copied before that happens.
 
   loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/script.luau", true))()
 ]]
@@ -337,7 +337,7 @@ local function main()
 		statusLabel.TextWrapped = true
 		statusLabel.TextColor3 = Color3.fromRGB(160, 210, 255)
 		statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-		statusLabel.Text = "Skips kick/ban/ping remotes. Shows exact path while probing. Culprit auto-blacklisted."
+		statusLabel.Text = "Kick at END = batch AC (working). Report auto-copies when scan finishes."
 		statusLabel.Parent = panel
 
 		pathInput = Instance.new("TextBox")
@@ -454,7 +454,8 @@ local function main()
 			reportLine("Payload: stealth (no __AC_PROBE__ tag)")
 		end
 		reportLine("")
-		reportLine("NOTE: Kicked when scan ends? Your anti-cheat flagged the batch — script does NOT call Kick.")
+		reportLine("NOTE: Kick AFTER scan ends = delayed batch kick (AC counted all probes).")
+		reportLine("      This script does NOT call Kick. Report copies when scan finishes.")
 		reportLine("")
 
 		local remotes, skippedRemotes = collectRemotes()
@@ -487,11 +488,10 @@ local function main()
 			return
 		end
 
-		reportLine("========== PROBE ORDER (if kicked at X/X, it's #[X] below) ==========")
+		reportLine("========== PROBE ORDER ==========")
 		for i, remote in ipairs(remotes) do
 			local path = remote:GetFullName()
-			local marker = (i == #remotes) and "  <<< LAST — common kick spot" or ""
-			reportLine(string.format("[%d] %s (%s)%s", i, path, remote.ClassName, marker))
+			reportLine(string.format("[%d] %s (%s)", i, path, remote.ClassName))
 		end
 		reportLine("")
 		flushDisplay(false)
@@ -525,9 +525,6 @@ local function main()
 			local waitText = activeConfig.delay > 0 and string.format(" (%.1fs wait)", activeConfig.delay) or ""
 			statusLabel.Text = string.format("[%s] %d/%d%s\n%s", activeConfig.label, i, #remotes, waitText, path)
 
-			if i == #remotes then
-				reportLine(">>> LAST REMOTE — kicks many people here:")
-			end
 			reportLine(">>> PROBING NOW [" .. i .. "/" .. #remotes .. "]: " .. path)
 			flushDisplay(false)
 
@@ -575,6 +572,30 @@ local function main()
 			end
 		end
 
+		-- Save report NOW — before AC's delayed "scan finished" kick (Error 267)
+		reportLine("")
+		reportLine("========== SCAN FINISHED ==========")
+		reportLine("Probed " .. #remotes .. " remotes. Manipulable so far: " .. manipCount)
+		reportLine("")
+		reportLine("!!! If you get kicked in a few seconds, that's your AC reacting to")
+		reportLine("!!! the ENTIRE scan (batch kick) — NOT the last remote you probed.")
+		reportLine("!!! Error 267 after 'done' = anti-cheat is WORKING as intended.")
+
+		flushDisplay(true)
+		local copied, chars = copyText()
+
+		if copied then
+			statusLabel.Text = string.format(
+				"DONE — %d/%d manipulable. Report COPIED (%d chars). Kick may happen now (batch AC).",
+				manipCount,
+				#remotes,
+				chars
+			)
+		else
+			statusLabel.Text = "DONE — Press Copy All NOW before kick (batch AC may fire)."
+		end
+
+		-- Summary after clipboard save (kick may interrupt this — report already safe)
 		if pathInput and pathInput.Text ~= "" then
 			reportLine("")
 			reportLine("Custom: " .. pathInput.Text)
@@ -600,9 +621,9 @@ local function main()
 		reportLine("========== SUMMARY ==========")
 		reportLine("Manipulable: " .. manipCount)
 		reportLine("Not manipulable: " .. safeCount)
-		reportLine("")
 
 		if manipCount > 0 then
+			reportLine("")
 			reportLine("========== PATCH THESE ==========")
 			for path, info in pairs(Report.allRemotes) do
 				if Report.manipulable[path] then
@@ -611,12 +632,8 @@ local function main()
 			end
 		end
 
+		copyText()
 		flushDisplay(true)
-		local copied, chars = copyText()
-		statusLabel.Text = copied
-			and string.format("Done — %d manipulable. Copied %d chars.", manipCount, chars)
-			or string.format("Done — %d manipulable. Copy All if kicked.", manipCount)
-
 		scanRunning = false
 	end
 
