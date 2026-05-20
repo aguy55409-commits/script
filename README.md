@@ -12,7 +12,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/scr
 
 ## 2. Speed exploit test (`speed-test.luau`)
 
-**Fake treadmill + RakNet replay** (Potassium). **Record** on the treadmill (captures real network packets via `raknet.add_send_hook`). **START** anywhere to `raknet.send` those packets + FireServer backup. Requires executor `raknet` library.
+**Fake treadmill simulation** (no RakNet). **Record** on treadmill saves which `FireServer` payloads raised `leaderstats.Speed`. **START** replays that profile constantly anywhere.
 
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/speed-test.luau", true))()

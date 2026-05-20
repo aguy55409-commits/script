@@ -1,8 +1,8 @@
 --[[
-  CONSTANT SPEED / FAKE TREADMILL (Potassium + RakNet)
+  FAKE TREADMILL — no RakNet. Simulates recorded treadmill ticks via FireServer.
 
-  Record = capture packets ONLY (no raknet replay during record — that caused crashes)
-  START = constant treadmill ticks + replay
+  Record = finds which remote payloads raise leaderstats.Speed (saved profile)
+  START = replays that profile constantly anywhere
 
   loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/speed-test.luau", true))()
 ]]
@@ -18,22 +18,16 @@ if not player then
 	error("Join a game first.")
 end
 
-local GUI_NAME = "ConstantSpeedTest"
-local hasRaknet = type(raknet) == "table"
-	and type(raknet.send) == "function"
-	and type(raknet.add_send_hook) == "function"
+local GUI_NAME = "FakeTreadmillSim"
 
 local running = false
-local recording = false
-local capturedPackets = {}
+local savedActions = {} -- simulated "recording": { name, args }
 local cachedBelts = {}
-local sendHookFn = nil
 local loopConns = {}
 local watchConns = {}
 local applyAmount = 100
 local stepAmount = 1000
-local firesPerTick = 15
-local captureUntil = 0
+local firesPerTick = 8
 
 local logLines = {}
 local fakeLabel
@@ -46,6 +40,26 @@ local screenGui
 
 local fireTouch = firetouchinterest or (syn and syn.firetouchinterest)
 
+-- Default simulation if Record finds nothing (your game's likely shapes)
+local DEFAULT_ACTIONS = {
+	{ name = "CheckGoldTreadmill", args = {} },
+	{ name = "CheckGoldTreadmill", args = { true } },
+	{ name = "TreadmillSignal", args = {} },
+	{ name = "TreadmillSignal", args = { true } },
+	{ name = "SetCustomSpeed", args = { 100 }, dynamic = true },
+}
+
+local TRIAL_ACTIONS = {
+	{ name = "TreadmillSignal", args = {} },
+	{ name = "TreadmillSignal", args = { true } },
+	{ name = "TreadmillSignal", args = { 1 } },
+	{ name = "TreadmillSignal", args = { "tick" } },
+	{ name = "CheckGoldTreadmill", args = {} },
+	{ name = "CheckGoldTreadmill", args = { true } },
+	{ name = "SetCustomSpeed", args = { 100 }, dynamic = true },
+	{ name = "SetCustomSpeed", args = { "100" }, dynamic = true },
+}
+
 local function log(msg)
 	table.insert(logLines, msg)
 	if #logLines > 50 then
@@ -57,12 +71,14 @@ local function log(msg)
 	end
 end
 
+-- FIX: gsub returns 2 values — must not pass count as tonumber base
 local function parseNum(v)
 	if type(v) == "number" then
 		return v
 	end
 	if type(v) == "string" then
-		return tonumber(v:gsub(",", ""))
+		local cleaned = string.gsub(v, ",", "")
+		return tonumber(cleaned)
 	end
 	return nil
 end
@@ -84,80 +100,34 @@ local function getSpeedNum()
 	return parseNum(v)
 end
 
-local function safeClonePacketData(packet)
-	local ok, arr = pcall(function()
-		return packet.AsArray
-	end)
-	if ok and type(arr) == "table" then
-		local t = {}
-		for i, v in ipairs(arr) do
-			t[i] = v
-		end
-		if #t > 0 then
-			return t
-		end
-	end
-	ok, arr = pcall(function()
-		return packet.AsString
-	end)
-	if ok and type(arr) == "string" and #arr > 0 then
-		return arr
-	end
-	return nil
+local function getRemote(name)
+	local folder = ReplicatedStorage:FindFirstChild("Remotes")
+	return folder and folder:FindFirstChild(name)
 end
 
-local function storePacket(packet)
-	local ok, err = pcall(function()
-		if not packet then
-			return
-		end
-		local data = safeClonePacketData(packet)
-		if not data then
-			return
-		end
-		local size = packet.Size or 0
-		local key = tostring(packet.PacketId) .. ":" .. tostring(size)
-		if type(data) == "table" then
-			key ..= ":" .. tostring(data[1])
-		end
-		for _, p in capturedPackets do
-			if p.key == key then
-				return
-			end
-		end
-		table.insert(capturedPackets, {
-			key = key,
-			data = data,
-			priority = packet.Priority or 1,
-			reliability = packet.Reliability or 0,
-			ordering = packet.OrderingChannel or 0,
-		})
-		if #capturedPackets > 50 then
-			table.remove(capturedPackets, 1)
-		end
-	end)
-	if not ok then
-		warn("[SpeedTest] storePacket: " .. tostring(err))
-	end
-end
-
-local function setupRaknet()
-	if not hasRaknet or sendHookFn then
-		return true
-	end
-	sendHookFn = function(packet)
-		-- Never call raknet.send from inside this hook
-		if recording or os.clock() < captureUntil then
-			storePacket(packet)
-		end
-	end
-	local ok, err = pcall(raknet.add_send_hook, sendHookFn)
-	if not ok then
-		log("RakNet hook failed: " .. tostring(err))
+local function fireAction(action, amount)
+	local remote = getRemote(action.name)
+	if not remote then
 		return false
 	end
-	log("RakNet hook OK")
-	return true
+	local args = {}
+	for _, v in ipairs(action.args) do
+		if action.dynamic and type(v) == "number" then
+			table.insert(args, amount)
+		elseif action.dynamic and type(v) == "string" and tonumber(v) then
+			table.insert(args, tostring(amount))
+		else
+			table.insert(args, v)
+		end
+	end
+	local ok = pcall(function()
+		if remote:IsA("RemoteEvent") then
+			remote:FireServer(table.unpack(args))
+		else
+			remote:InvokeServer(table.unpack(args))
+		end
+	end)
+	return ok
 end
 
 local function scanBelts()
@@ -167,45 +137,15 @@ local function scanBelts()
 			local n = string.lower(inst.Name)
 			if string.find(n, "treadmill", 1, true) or string.find(n, "belt", 1, true) then
 				table.insert(cachedBelts, inst)
+				if #cachedBelts >= 15 then
+					break
+				end
 			end
 		end
 	end
-	return #cachedBelts
 end
 
-local function getRemotes()
-	local folder = ReplicatedStorage:FindFirstChild("Remotes")
-	if not folder then
-		return {}
-	end
-	return {
-		TreadmillSignal = folder:FindFirstChild("TreadmillSignal"),
-		CheckGold = folder:FindFirstChild("CheckGoldTreadmill"),
-		SetCustom = folder:FindFirstChild("SetCustomSpeed"),
-	}
-end
-
--- FireServer only (safe during Record — no raknet.send replay)
-local function fireRemotesOnly(amount)
-	local r = getRemotes()
-	captureUntil = os.clock() + 0.1
-
-	pcall(function()
-		if r.CheckGold and r.CheckGold:IsA("RemoteEvent") then
-			r.CheckGold:FireServer()
-			r.CheckGold:FireServer(true)
-		end
-		if r.TreadmillSignal and r.TreadmillSignal:IsA("RemoteEvent") then
-			r.TreadmillSignal:FireServer()
-			r.TreadmillSignal:FireServer(true)
-		end
-		if r.SetCustom and r.SetCustom:IsA("RemoteEvent") then
-			r.SetCustom:FireServer(amount)
-		end
-	end)
-end
-
-local function touchCachedBelts()
+local function touchBelts()
 	if not fireTouch then
 		return
 	end
@@ -213,35 +153,31 @@ local function touchCachedBelts()
 	if not hrp then
 		return
 	end
-	for i = 1, math.min(#cachedBelts, 12) do
-		local p = cachedBelts[i]
-		if p and p.Parent then
+	for _, p in cachedBelts do
+		if p.Parent then
 			pcall(fireTouch, p, hrp, 0)
 			pcall(fireTouch, p, hrp, 1)
 		end
 	end
 end
 
-local function replayRaknetOnce()
-	if not hasRaknet or #capturedPackets == 0 or recording then
-		return
+local function getActiveActions()
+	if #savedActions > 0 then
+		return savedActions
 	end
-	for _, pkt in capturedPackets do
-		pcall(raknet.send, pkt.data, pkt.priority, pkt.reliability, pkt.ordering)
-	end
+	return DEFAULT_ACTIONS
 end
 
--- Full tick for START (includes replay)
-local function fireFullTick(amount)
-	fireRemotesOnly(amount)
-	replayRaknetOnce()
-	touchCachedBelts()
+-- Simulate one treadmill "tick" — replay saved profile
+local function simulateTreadmillTick(amount)
+	for _, action in ipairs(getActiveActions()) do
+		fireAction(action, amount)
+	end
+	touchBelts()
 end
 
 local function stopLoops()
 	running = false
-	recording = false
-	captureUntil = 0
 	for _, c in loopConns do
 		pcall(function()
 			c:Disconnect()
@@ -266,81 +202,65 @@ local function hookSpeedWatchers()
 			end
 		end))
 	end
-
-	local upd = ReplicatedStorage:FindFirstChild("Remotes") and ReplicatedStorage.Remotes:FindFirstChild("UpdateSpeed")
-	if upd and upd:IsA("RemoteEvent") then
-		table.insert(watchConns, upd.OnClientEvent:Connect(function(a1, a2)
-			log("<< UpdateSpeed: " .. tostring(a1) .. " " .. tostring(a2))
-		end))
-	end
 end
 
+-- Record = test payloads, save ones that changed Speed (simulated recording)
 local function runRecord()
 	local ok, err = pcall(function()
 		stopLoops()
-		if not hasRaknet then
-			log("No raknet — cannot record packets")
-			return
-		end
-		if not setupRaknet() then
-			return
-		end
-
+		table.clear(savedActions)
 		scanBelts()
-		table.clear(capturedPackets)
-		recording = true
 
-		log("RECORD 5s — walk on treadmill")
+		log("RECORD — testing payloads on treadmill...")
 		if fakeLabel then
-			fakeLabel.Text = "RECORDING — on treadmill!"
+			fakeLabel.Text = "RECORDING — stand on treadmill!"
 		end
 
-		local t0 = os.clock()
-		local n = 0
-		while os.clock() - t0 < 5 and recording do
-			n += 1
-			-- ONLY FireServer during record (no raknet.send = no hook loop / crash)
-			fireRemotesOnly(applyAmount)
-			if n % 3 == 0 then
-				touchCachedBelts()
+		applyAmount = tonumber(targetBox and targetBox.Text) or applyAmount
+		local before = getSpeedNum()
+
+		for _, trial in ipairs(TRIAL_ACTIONS) do
+			local spBefore = getSpeedNum()
+			fireAction(trial, applyAmount)
+			touchBelts()
+			task.wait(0.25)
+			local spAfter = getSpeedNum()
+			if spBefore and spAfter and spAfter > spBefore then
+				table.insert(savedActions, {
+					name = trial.name,
+					args = trial.args,
+					dynamic = trial.dynamic,
+				})
+				log(string.format("  saved %s %s (+%s)", trial.name, table.concat(trial.args, ","), spAfter - spBefore))
 			end
-			if n % 5 == 0 then
-				log("  recording... " .. #capturedPackets .. " pkts")
-			end
-			task.wait(0.2)
 		end
 
-		recording = false
-		captureUntil = 0
-		log("Done: " .. #capturedPackets .. " packets captured")
+		if #savedActions == 0 then
+			log("No payload moved Speed — using default simulation")
+			for _, a in ipairs(DEFAULT_ACTIONS) do
+				table.insert(savedActions, a)
+			end
+		end
+
+		local after = getSpeedNum()
+		log(string.format("Profile: %d actions | Speed %s -> %s", #savedActions, tostring(before), tostring(after)))
 		if fakeLabel then
-			fakeLabel.Text = #capturedPackets > 0
-				and ("Got " .. #capturedPackets .. " pkts — press START")
-				or "0 packets — walk on belt & Record again"
+			fakeLabel.Text = string.format("Saved %d ticks — press START", #savedActions)
 		end
 	end)
 
 	if not ok then
-		recording = false
-		captureUntil = 0
-		log("RECORD CRASHED: " .. tostring(err))
-		if fakeLabel then
-			fakeLabel.Text = "Record error — see log"
-		end
+		log("RECORD ERROR: " .. tostring(err))
 		warn(err)
 	end
 end
 
 local function runConstant()
-	if running then
-		return
-	end
-
 	local ok, err = pcall(function()
-		setupRaknet()
+		stopLoops()
 		scanBelts()
 		applyAmount = tonumber(targetBox and targetBox.Text) or applyAmount
-		firesPerTick = math.clamp(tonumber(firesBox and firesBox.Text) or 15, 1, 40)
+		firesPerTick = math.clamp(tonumber(firesBox and firesBox.Text) or 8, 1, 30)
 
 		running = true
 		local frame = 0
@@ -348,12 +268,9 @@ local function runConstant()
 		local lastTime = os.clock()
 		local totalGain = 0
 
-		log("START — constant ticks | pkts: " .. #capturedPackets)
-		if #capturedPackets == 0 then
-			log("No recorded packets — FireServer only")
-		end
+		log("START — simulating " .. #getActiveActions() .. " saved ticks")
 		if fakeLabel then
-			fakeLabel.Text = "RUNNING"
+			fakeLabel.Text = "SIMULATING treadmill anywhere"
 		end
 
 		local function tick()
@@ -366,12 +283,12 @@ local function runConstant()
 			applyAmount = tonumber(targetBox and targetBox.Text) or applyAmount
 
 			for _ = 1, firesPerTick do
-				fireFullTick(applyAmount)
+				simulateTreadmillTick(applyAmount)
 			end
 
 			local now = os.clock()
 			local cur = getSpeedNum()
-			if cur and cur > lastNum then
+			if cur and lastNum and cur > lastNum then
 				totalGain += cur - lastNum
 				lastNum = cur
 			end
@@ -386,16 +303,15 @@ local function runConstant()
 					rateLabel.Text = string.format("+%.0f/s | frame %d", perSec, frame)
 				end
 				if fakeLabel then
-					if perSec > 0 then
-						fakeLabel.Text = "SPEED RISING"
-						fakeLabel.TextColor3 = Color3.fromRGB(80, 255, 120)
-					else
-						fakeLabel.Text = "Running (server may block)"
-						fakeLabel.TextColor3 = Color3.fromRGB(255, 190, 80)
-					end
+					fakeLabel.Text = perSec > 0 and "SPEED RISING" or "Simulating (server may block off-belt)"
+					fakeLabel.TextColor3 = perSec > 0 and Color3.fromRGB(80, 255, 120) or Color3.fromRGB(255, 190, 80)
 				end
 				totalGain = 0
 				lastTime = now
+			end
+
+			if frame % 300 == 0 then
+				applyAmount = math.min(applyAmount + stepAmount, 1e15)
 			end
 		end
 
@@ -404,7 +320,7 @@ local function runConstant()
 
 	if not ok then
 		stopLoops()
-		log("START CRASHED: " .. tostring(err))
+		log("START ERROR: " .. tostring(err))
 		warn(err)
 	end
 end
@@ -419,11 +335,8 @@ local function buildGui()
 	end)
 
 	for _, g in ipairs({ CoreGui, player:FindFirstChild("PlayerGui") }) do
-		if g then
-			local o = g:FindFirstChild(GUI_NAME)
-			if o then
-				o:Destroy()
-			end
+		if g and g:FindFirstChild(GUI_NAME) then
+			g[GUI_NAME]:Destroy()
 		end
 	end
 
@@ -439,7 +352,7 @@ local function buildGui()
 	end
 
 	local p = Instance.new("Frame")
-	p.Size = UDim2.fromOffset(460, 420)
+	p.Size = UDim2.fromOffset(450, 400)
 	p.Position = UDim2.fromScale(0.5, 0.5)
 	p.AnchorPoint = Vector2.new(0.5, 0.5)
 	p.BackgroundColor3 = Color3.fromRGB(22, 24, 32)
@@ -447,20 +360,20 @@ local function buildGui()
 	Instance.new("UICorner", p).CornerRadius = UDim.new(0, 10)
 
 	fakeLabel = Instance.new("TextLabel")
-	fakeLabel.Size = UDim2.new(1, -20, 0, 40)
+	fakeLabel.Size = UDim2.new(1, -20, 0, 44)
 	fakeLabel.Position = UDim2.fromOffset(10, 10)
 	fakeLabel.BackgroundColor3 = Color3.fromRGB(35, 28, 20)
 	fakeLabel.Font = Enum.Font.GothamBold
-	fakeLabel.TextSize = 13
+	fakeLabel.TextSize = 12
 	fakeLabel.TextWrapped = true
 	fakeLabel.TextColor3 = Color3.fromRGB(255, 190, 80)
-	fakeLabel.Text = "Record on treadmill, then START anywhere"
+	fakeLabel.Text = "No RakNet — simulates FireServer ticks from Record"
 	fakeLabel.Parent = p
 	Instance.new("UICorner", fakeLabel).CornerRadius = UDim.new(0, 6)
 
 	speedLabel = Instance.new("TextLabel")
 	speedLabel.BackgroundTransparency = 1
-	speedLabel.Position = UDim2.fromOffset(10, 56)
+	speedLabel.Position = UDim2.fromOffset(10, 58)
 	speedLabel.Size = UDim2.new(1, -20, 0, 20)
 	speedLabel.Font = Enum.Font.Code
 	speedLabel.TextSize = 12
@@ -471,7 +384,7 @@ local function buildGui()
 
 	rateLabel = Instance.new("TextLabel")
 	rateLabel.BackgroundTransparency = 1
-	rateLabel.Position = UDim2.fromOffset(10, 78)
+	rateLabel.Position = UDim2.fromOffset(10, 80)
 	rateLabel.Size = UDim2.new(1, -20, 0, 18)
 	rateLabel.Font = Enum.Font.Gotham
 	rateLabel.TextSize = 11
@@ -483,7 +396,7 @@ local function buildGui()
 	local function box(lbl, y, val)
 		local l = Instance.new("TextLabel")
 		l.Text = lbl
-		l.Size = UDim2.fromOffset(100, 18)
+		l.Size = UDim2.fromOffset(95, 18)
 		l.Position = UDim2.fromOffset(10, y)
 		l.BackgroundTransparency = 1
 		l.Font = Enum.Font.Gotham
@@ -492,8 +405,8 @@ local function buildGui()
 		l.TextXAlignment = Enum.TextXAlignment.Left
 		l.Parent = p
 		local b = Instance.new("TextBox")
-		b.Size = UDim2.fromOffset(340, 22)
-		b.Position = UDim2.fromOffset(110, y - 2)
+		b.Size = UDim2.fromOffset(335, 22)
+		b.Position = UDim2.fromOffset(105, y - 2)
 		b.Text = tostring(val)
 		b.BackgroundColor3 = Color3.fromRGB(12, 14, 20)
 		b.TextColor3 = Color3.new(1, 1, 1)
@@ -505,12 +418,12 @@ local function buildGui()
 		return b
 	end
 
-	targetBox = box("Speed value", 102, applyAmount)
-	firesBox = box("Fires/tick", 128, firesPerTick)
+	targetBox = box("Speed send", 104, applyAmount)
+	firesBox = box("Ticks/frame", 130, firesPerTick)
 
 	local scroll = Instance.new("ScrollingFrame")
 	scroll.Position = UDim2.fromOffset(10, 158)
-	scroll.Size = UDim2.new(1, -20, 1, -210)
+	scroll.Size = UDim2.new(1, -20, 1, -200)
 	scroll.BackgroundColor3 = Color3.fromRGB(10, 12, 18)
 	scroll.BorderSizePixel = 0
 	scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
@@ -532,7 +445,7 @@ local function buildGui()
 		local b = Instance.new("TextButton")
 		b.Text = t
 		b.Size = UDim2.fromOffset(w, 34)
-		b.Position = UDim2.fromOffset(x, 378)
+		b.Position = UDim2.fromOffset(x, 358)
 		b.BackgroundColor3 = col
 		b.TextColor3 = Color3.new(1, 1, 1)
 		b.Font = Enum.Font.GothamBold
@@ -542,30 +455,27 @@ local function buildGui()
 		b.MouseButton1Click:Connect(fn)
 	end
 
-	mkbtn("Record", 8, 70, function()
+	mkbtn("Record", 8, 72, function()
 		task.spawn(runRecord)
 	end, Color3.fromRGB(180, 90, 40))
-	mkbtn("START", 84, 80, function()
+	mkbtn("START", 88, 72, function()
 		task.spawn(runConstant)
 	end, Color3.fromRGB(40, 150, 70))
-	mkbtn("Stop", 170, 60, function()
+	mkbtn("Stop", 168, 55, function()
 		stopLoops()
 		log("Stopped")
-		if fakeLabel then
-			fakeLabel.Text = "Stopped"
-		end
 	end, Color3.fromRGB(180, 60, 60))
-	mkbtn("X", 236, 50, function()
+	mkbtn("X", 230, 55, function()
 		stopLoops()
-		if screenGui then
-			screenGui:Destroy()
-		end
+		screenGui:Destroy()
 	end, Color3.fromRGB(70, 75, 90))
 end
 
 buildGui()
 hookSpeedWatchers()
-scanBelts()
-log("GUI ready.")
-log(hasRaknet and "RakNet: Record captures packets safely" or "No raknet library")
-log("Record = FireServer only | START = replay + FireServer")
+for _, a in ipairs(DEFAULT_ACTIONS) do
+	table.insert(savedActions, a)
+end
+log("No RakNet — uses FireServer simulation.")
+log("Record on treadmill saves working payloads.")
+log("START replays them constantly. (START crash fixed)")
