@@ -26,7 +26,7 @@ local function main()
 
 	local GUI_NAME = "ServerExploitProbe"
 	local PROBE_TAG = "__AC_PROBE__"
-	local REMOTE_SCAN_CAP = 80
+	local DISPLAY_FLUSH_EVERY = 40
 
 	-- Remove old UI so re-execute works
 	_G.__ServerExploitProbeLoaded = nil
@@ -52,16 +52,26 @@ local function main()
 	local scrollFrame
 	local pathInput
 
-	local function reportLine(text)
+	local lineCount = 0
+
+	local function reportLine(text, skipPrint)
 		table.insert(Report.lines, text)
-		print("[ExploitProbe] " .. text)
-		if reportLabel then
-			reportLabel.Text = table.concat(Report.lines, "\n")
-			if scrollFrame then
-				scrollFrame.CanvasPosition = Vector2.new(0, math.max(0, scrollFrame.AbsoluteCanvasSize.Y))
-			end
+		lineCount += 1
+		if not skipPrint then
+			print("[ExploitProbe] " .. text)
 		end
-		task.wait()
+	end
+
+	local function flushDisplay(scrollToBottom)
+		if not reportLabel then
+			return
+		end
+		reportLabel.Text = table.concat(Report.lines, "\n")
+		if scrollFrame and scrollToBottom then
+			task.defer(function()
+				scrollFrame.CanvasPosition = Vector2.new(0, scrollFrame.AbsoluteCanvasSize.Y)
+			end)
+		end
 	end
 
 	local function getGuiRoot()
@@ -151,7 +161,9 @@ local function main()
 		scrollFrame.Size = UDim2.new(1, -24, 1, -158)
 		scrollFrame.BackgroundColor3 = Color3.fromRGB(10, 12, 18)
 		scrollFrame.BorderSizePixel = 0
-		scrollFrame.ScrollBarThickness = 8
+		scrollFrame.ScrollBarThickness = 10
+		scrollFrame.ScrollingDirection = Enum.ScrollingDirection.Y
+		scrollFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
 		scrollFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
 		scrollFrame.Parent = panel
 
@@ -159,10 +171,16 @@ local function main()
 		scrollCorner.CornerRadius = UDim.new(0, 6)
 		scrollCorner.Parent = scrollFrame
 
+		local scrollContent = Instance.new("Frame")
+		scrollContent.Name = "Content"
+		scrollContent.BackgroundTransparency = 1
+		scrollContent.Size = UDim2.new(1, -8, 0, 0)
+		scrollContent.AutomaticSize = Enum.AutomaticSize.Y
+		scrollContent.Parent = scrollFrame
+
 		reportLabel = Instance.new("TextLabel")
 		reportLabel.BackgroundTransparency = 1
-		reportLabel.Size = UDim2.new(1, -12, 0, 0)
-		reportLabel.Position = UDim2.fromOffset(6, 6)
+		reportLabel.Size = UDim2.new(1, 0, 0, 0)
 		reportLabel.Font = Enum.Font.Code
 		reportLabel.TextSize = 11
 		reportLabel.TextColor3 = Color3.fromRGB(200, 210, 225)
@@ -171,11 +189,7 @@ local function main()
 		reportLabel.TextWrapped = true
 		reportLabel.Text = "Loading..."
 		reportLabel.AutomaticSize = Enum.AutomaticSize.Y
-		reportLabel.Parent = scrollFrame
-
-		reportLabel:GetPropertyChangedSignal("TextBounds"):Connect(function()
-			scrollFrame.CanvasSize = UDim2.fromOffset(0, reportLabel.TextBounds.Y + 16)
-		end)
+		reportLabel.Parent = scrollContent
 
 		local function btn(text, x, w, fn, col)
 			local b = Instance.new("TextButton")
@@ -196,17 +210,21 @@ local function main()
 		return btn
 	end
 
+	local function getFullReportText()
+		return table.concat(Report.lines, "\n")
+	end
+
 	local function copyText()
-		local text = table.concat(Report.lines, "\n")
+		local text = getFullReportText()
 		if text == "" then
-			return false
+			return false, 0
 		end
 		if setclipboard then
 			local ok = pcall(function()
 				setclipboard(text)
 			end)
 			if ok then
-				return true
+				return true, #text
 			end
 		end
 		if toclipboard then
@@ -214,10 +232,10 @@ local function main()
 				toclipboard(text)
 			end)
 			if ok then
-				return true
+				return true, #text
 			end
 		end
-		return false
+		return false, #text
 	end
 
 	local function collectRemotes()
@@ -274,7 +292,7 @@ local function main()
 											reason = "mentions " .. name,
 											remote = remotePath,
 										}
-										reportLine("Linked script: " .. spath)
+										reportLine("Linked script: " .. spath, true)
 									end
 								end
 							end
@@ -322,11 +340,18 @@ local function main()
 				status = "pending",
 			}
 
-			reportLine(string.format("[%d] %s (%s)", i, path, className))
+			reportLine(string.format("[%d] %s (%s)", i, path, className), true)
+			if i % DISPLAY_FLUSH_EVERY == 0 then
+				flushDisplay(false)
+				if statusLabel then
+					statusLabel.Text = "Listing remotes... " .. i .. "/" .. #remotes
+				end
+			end
 		end
 
 		reportLine("")
 		reportLine(string.format("Total: %d RemoteEvent, %d RemoteFunction", eventCount, funcCount))
+		flushDisplay(true)
 	end
 
 	local function appendRemoteResults()
@@ -346,8 +371,9 @@ local function main()
 
 		for _, path in ipairs(paths) do
 			local info = Report.allRemotes[path]
-			reportLine(string.format("[%d] %s (%s) — %s", info.index, path, info.className, info.status))
+			reportLine(string.format("[%d] %s (%s) — %s", info.index, path, info.className, info.status), true)
 		end
+		flushDisplay(true)
 	end
 
 	local function runScan()
@@ -355,6 +381,7 @@ local function main()
 		Report.vulnerableRemotes = {}
 		Report.linkedScripts = {}
 		Report.allRemotes = {}
+		lineCount = 0
 
 		reportLine("=== EXPLOIT PROBE ===")
 		reportLine("Player: " .. player.Name)
@@ -426,18 +453,14 @@ local function main()
 			reportLine("========== FIRING REMOTES (probe) ==========")
 		end
 
-		local sent, blocked, skipped = 0, 0, 0
+		local sent, blocked = 0, 0
+		local total = #remotes
 		for i, remote in ipairs(remotes) do
 			local path = remote:GetFullName()
 			local entry = Report.allRemotes[path]
 
-			if i > REMOTE_SCAN_CAP then
-				skipped += 1
-				if entry then
-					entry.status = "SKIPPED (over cap " .. REMOTE_SCAN_CAP .. ")"
-				end
-				reportLine("SKIPPED: " .. path)
-				continue
+			if statusLabel and i % 10 == 0 then
+				statusLabel.Text = string.format("Probing remotes %d/%d...", i, total)
 			end
 
 			local ok, err = pcall(function()
@@ -454,20 +477,16 @@ local function main()
 					entry.status = "REACHABLE"
 				end
 				addVulnerable(remote, "FireServer/InvokeServer returned no error")
-				reportLine("REACHABLE: " .. path)
 			else
 				blocked += 1
 				if entry then
 					entry.status = "BLOCKED — " .. tostring(err)
 				end
-				reportLine("BLOCKED: " .. path .. " | " .. tostring(err))
-			end
-			if i % 5 == 0 then
-				task.wait()
 			end
 		end
 		reportLine("")
-		reportLine(string.format("Probe: %d reachable, %d blocked, %d skipped", sent, blocked, skipped))
+		reportLine(string.format("Probe: %d reachable, %d blocked (of %d total)", sent, blocked, total))
+		flushDisplay(false)
 
 		appendRemoteResults()
 
@@ -507,11 +526,26 @@ local function main()
 			reportLine("No reachable remotes OR game has no remotes yet.")
 		end
 
+		flushDisplay(true)
+
 		local totalRemotes = 0
 		for _ in pairs(Report.allRemotes) do
 			totalRemotes += 1
 		end
-		statusLabel.Text = string.format("Done — %d remotes listed, %d reachable. Press Copy.", totalRemotes, n)
+		local chars = #getFullReportText()
+		statusLabel.Text = string.format(
+			"Done — %d remotes, %d lines, %d reachable. Copy = FULL report (%d chars).",
+			totalRemotes,
+			lineCount,
+			n,
+			chars
+		)
+
+		-- Auto-copy full report so nothing is lost
+		local copied, _ = copyText()
+		if copied then
+			statusLabel.Text = statusLabel.Text .. " Auto-copied!"
+		end
 	end
 
 	local makeBtn = mountGui()
@@ -521,11 +555,13 @@ local function main()
 		task.spawn(runScan)
 	end)
 
-	makeBtn("Copy", 108, 70, function()
-		if copyText() then
-			statusLabel.Text = "Copied to clipboard!"
+	makeBtn("Copy All", 108, 88, function()
+		flushDisplay(true)
+		local copied, chars = copyText()
+		if copied then
+			statusLabel.Text = string.format("Copied ALL %d lines (%d chars) to clipboard.", lineCount, chars)
 		else
-			statusLabel.Text = "Copy failed — select text in box manually."
+			statusLabel.Text = string.format("Copy failed. Scroll log, Ctrl+A/C. Report has %d chars.", chars)
 		end
 	end)
 
