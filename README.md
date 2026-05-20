@@ -12,7 +12,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/scr
 
 ## 2. Speed exploit test (`speed-test.luau`)
 
-**Universal speed test** — auto-scans any game for speed remotes and stats (leaderstats, WalkSpeed, attributes). **Scan → Probe → Start**. Works on treadmill simulators, RPGs, obbies, etc. No treadmill required.
+**Fake treadmill mode** — constantly tricks the game into thinking you're on the belt: ghost-touch, spoof `OnTreadmill` attrs, spam `TreadmillSignal` / `CheckGoldTreadmill` every frame. Works **anywhere** on the map. **Scan → START**.
 
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/speed-test.luau", true))()
