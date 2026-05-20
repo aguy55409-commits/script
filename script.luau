@@ -48,6 +48,7 @@ local function main()
 			skipRemoteFunctions = false,
 			autoCopyEvery = 5,
 			flushEvery = 5,
+			securityLevel = "full",
 		},
 		medium = {
 			label = "Medium",
@@ -56,6 +57,7 @@ local function main()
 			skipRemoteFunctions = true,
 			autoCopyEvery = 8,
 			flushEvery = 10,
+			securityLevel = "normal",
 		},
 		fast = {
 			label = "Fast",
@@ -64,7 +66,19 @@ local function main()
 			skipRemoteFunctions = false,
 			autoCopyEvery = 12,
 			flushEvery = 25,
+			securityLevel = "quick",
 		},
+	}
+
+	local PATCH_ADVICE = {
+		reachable = "Handler must treat every client call as hostile — validate at entry.",
+		malformed = "Add arg type/shape checks at the TOP of OnServerEvent (before deep logic).",
+		trusted_client = "Never trust client userid/currency/items — use server-authoritative state only.",
+		no_rate_limit = "Add per-player rate limits / cooldowns on this remote.",
+		replay = "Add nonce or timestamp replay protection (reject duplicate payloads).",
+		numeric = "Sanity-check all numbers (range, NaN, negatives where invalid).",
+		impossible = "Reject impossible state transitions server-side (preconditions first).",
+		fire_only = "Don't only check that the remote fired — validate args and game state.",
 	}
 
 	-- Remotes matching these are NOT probed (likely to kick / ban / flag you)
@@ -145,7 +159,7 @@ local function main()
 		return culprits and culprits[path]
 	end
 
-	local Report = { lines = {}, allRemotes = {}, manipulable = {} }
+	local Report = { lines = {}, allRemotes = {}, manipulable = {}, vulnFindings = {} }
 	local screenGui, statusLabel, reportLabel, scrollFrame, pathInput
 	local lineCount = 0
 	local scanRunning = false
@@ -227,45 +241,162 @@ local function main()
 		return false, #text
 	end
 
-	local function getProbePayload()
-		if USE_STEALTH_PAYLOAD then
-			return "test"
-		end
-		return "__AC_PROBE__", "manipulate_test"
-	end
-
-	local function tryManipulate(remote)
+	local function fireRemote(remote, timeout, ...)
+		local args = { ... }
 		local finished = false
-		local canManipulate = false
-		local reason = "unknown"
+		local ok, err = false, "unknown"
 
 		task.spawn(function()
-			local ok, err = pcall(function()
+			local callOk, callErr = pcall(function()
 				if remote:IsA("RemoteEvent") then
-					remote:FireServer(getProbePayload())
+					remote:FireServer(table.unpack(args))
 				else
-					remote:InvokeServer(getProbePayload())
+					remote:InvokeServer(table.unpack(args))
 				end
 			end)
-			canManipulate = ok
-			reason = ok and "probe accepted" or tostring(err)
+			ok = callOk
+			err = callErr
 			finished = true
 		end)
 
 		local start = tick()
-		local timeout = activeConfig.timeout
-		local poll = activeConfig.delay == 0 and 0 or 0.05
+		local poll = activeConfig.delay == 0 and 0 or 0.03
 		while not finished and tick() - start < timeout do
 			task.wait(poll)
 		end
 
 		if not finished then
-			return false, "timeout — stopped"
+			return false, "timeout"
 		end
-		if canManipulate then
-			return true, reason
+		if ok then
+			return true, "sent"
 		end
-		return false, reason
+		return false, tostring(err)
+	end
+
+	local function runSecurityAudit(remote)
+		local timeout = activeConfig.timeout
+		local level = activeConfig.securityLevel or "normal"
+		local issues = {}
+		local lines = {}
+
+		local function flag(id, detail)
+			table.insert(issues, id)
+			table.insert(lines, "  [VULN] " .. detail)
+		end
+
+		local function pass(detail)
+			table.insert(lines, "  [OK]   " .. detail)
+		end
+
+		-- 1) Reachable from client
+		local okReach, reachErr = fireRemote(remote, timeout, "probe_reach")
+		if okReach then
+			flag("reachable", "Remote exists & client can FireServer/InvokeServer")
+		else
+			pass("Not reachable from client (" .. tostring(reachErr) .. ")")
+			return { issues = issues, lines = lines, reachable = false }
+		end
+
+		if level == "quick" then
+			pass("Quick mode — run Slow for full malformed/rate/replay/impossible checks")
+			return { issues = issues, lines = lines, reachable = true }
+		end
+
+		-- 2) Malformed / wrong-shaped args (client-side fire — server may still reject later)
+		local malformedTests = {
+			{ "nil", { nil } },
+			{ "empty", {} },
+			{ "wrong_types", { true, {}, function() end, "string", math.huge } },
+			{ "negative_id", { -1, -999999 } },
+		}
+		local malformedHits = 0
+		for _, t in ipairs(malformedTests) do
+			local ok = fireRemote(remote, timeout, table.unpack(t[2]))
+			if ok then
+				malformedHits += 1
+			end
+		end
+		if malformedHits > 0 then
+			flag(
+				"malformed",
+				"Malformed calls not instantly rejected at client (" .. malformedHits .. "/" .. #malformedTests .. " sent)"
+			)
+		else
+			pass("Malformed arg shapes blocked or failed at client")
+		end
+
+		-- 3) Numeric sanity (currency-style probes)
+		if level == "full" or level == "normal" then
+			local okNum = fireRemote(remote, timeout, math.huge, -math.huge, 999999999, 0.001, -1)
+			if okNum then
+				flag("numeric", "Extreme numbers sent (huge/negative) — add server numeric sanity checks")
+			else
+				pass("Extreme numeric payload blocked at client")
+			end
+		end
+
+		-- 4) Trusted client-provided values (userid, name, fake admin)
+		if level == "full" or level == "normal" then
+			local fakeId = player.UserId + 99999
+			local okTrust = fireRemote(remote, timeout, fakeId, player.Name, "admin", 999999999, "give", "cash")
+			if okTrust then
+				flag("trusted_client", "Client-provided identity/currency-style values accepted from client")
+			else
+				pass("Spoofed identity/currency probe blocked at client")
+			end
+		end
+
+		-- 5) Per-player rate limiting
+		local burst = (level == "full") and 8 or 5
+		local burstOk = 0
+		for _ = 1, burst do
+			if fireRemote(remote, timeout, "rate_test", tick()) then
+				burstOk += 1
+			end
+		end
+		if burstOk >= burst - 1 then
+			flag("no_rate_limit", "Rapid repeat fires: " .. burstOk .. "/" .. burst .. " sent — add rate limits")
+		else
+			pass("Rate limit signal: only " .. burstOk .. "/" .. burst .. " rapid fires sent")
+		end
+
+		-- 6) Replay protection
+		if level == "full" or level == "normal" then
+			local payload = { nonce = "probe_fixed_nonce", action = "buy", amount = 99999, t = 12345 }
+			local r1 = fireRemote(remote, timeout, payload)
+			task.wait(0.05)
+			local r2 = fireRemote(remote, timeout, payload)
+			if r1 and r2 then
+				flag("replay", "Identical payload sent twice — add nonce/replay rejection")
+			else
+				pass("Replay probe did not fully send duplicate payloads")
+			end
+		end
+
+		-- 7) Impossible state transition probes
+		if level == "full" then
+			local okImp = fireRemote(
+				remote,
+				timeout,
+				"buy",
+				-1,
+				999999999,
+				"impossible_item",
+				{ owned = false, equipped = true, cooldown = 0 }
+			)
+			if okImp then
+				flag("impossible", "Impossible game-state payload sent — reject bad transitions server-side")
+			else
+				pass("Impossible-state payload blocked at client")
+			end
+		end
+
+		if #issues == 0 then
+			pass("No client-side red flags — still verify server rejects bad args in Studio")
+		end
+
+		return { issues = issues, lines = lines, reachable = true }
 	end
 
 	local function collectRemotes()
@@ -337,7 +468,7 @@ local function main()
 		statusLabel.TextWrapped = true
 		statusLabel.TextColor3 = Color3.fromRGB(160, 210, 255)
 		statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-		statusLabel.Text = "Kick at END = batch AC (working). Report auto-copies when scan finishes."
+		statusLabel.Text = "Security audit per remote. Report copies when done (batch kick may follow)."
 		statusLabel.Parent = panel
 
 		pathInput = Instance.new("TextBox")
@@ -401,31 +532,51 @@ local function main()
 		local path = remote:GetFullName()
 		local className = remote.ClassName
 
-		local probeOk, canManipulate, detail = pcall(function()
-			return tryManipulate(remote)
+		reportLine(string.format("[%d] %s (%s)", index, path, className))
+		reportLine("  --- security audit (client-side fire; server must reject bad data) ---")
+
+		local auditOk, audit = pcall(function()
+			return runSecurityAudit(remote)
 		end)
 
-		local status
-		if not probeOk then
-			status = "PROBE ERROR — " .. tostring(canManipulate)
-			canManipulate = false
-		elseif canManipulate then
-			status = "MANIPULABLE — " .. tostring(detail)
-			Report.manipulable[path] = true
-		else
-			status = "NOT MANIPULABLE — " .. tostring(detail)
+		if not auditOk then
+			reportLine("  [ERR]  Audit crashed: " .. tostring(audit))
+			Report.allRemotes[path] = {
+				index = index,
+				path = path,
+				className = className,
+				status = "AUDIT ERROR",
+				issues = {},
+			}
+			return false
 		end
 
+		for _, line in ipairs(audit.lines) do
+			reportLine(line)
+		end
+
+		if #audit.issues > 0 then
+			Report.manipulable[path] = true
+			Report.vulnFindings[path] = audit.issues
+			reportLine("  PATCH:")
+			for _, issueId in ipairs(audit.issues) do
+				local advice = PATCH_ADVICE[issueId]
+				if advice then
+					reportLine("    • " .. advice)
+				end
+			end
+		end
+
+		local status = (#audit.issues > 0) and ("VULNERABLE (" .. #audit.issues .. " checks)") or "LOOKS OK (client probes)"
 		Report.allRemotes[path] = {
 			index = index,
 			path = path,
 			className = className,
 			status = status,
+			issues = audit.issues,
 		}
 
-		reportLine(string.format("[%d] %s (%s)", index, path, className))
-		reportLine("     → " .. status)
-		return canManipulate == true
+		return audit.reachable and #audit.issues > 0
 	end
 
 	local function runScan(speedKey)
@@ -439,9 +590,10 @@ local function main()
 		Report.lines = {}
 		Report.allRemotes = {}
 		Report.manipulable = {}
+		Report.vulnFindings = {}
 		lineCount = 0
 
-		reportLine("=== REMOTE MANIPULATION PROBE ===")
+		reportLine("=== REMOTE SECURITY AUDIT ===")
 		reportLine("Player: " .. player.Name .. " | PlaceId: " .. game.PlaceId)
 		reportLine("Speed: " .. activeConfig.label)
 		reportLine("Delay: " .. activeConfig.delay .. "s | Timeout: " .. activeConfig.timeout .. "s per remote")
@@ -572,10 +724,43 @@ local function main()
 			end
 		end
 
-		-- Save report NOW — before AC's delayed "scan finished" kick (Error 267)
 		reportLine("")
+		reportLine("========== SECURITY FINDINGS SUMMARY ==========")
+		reportLine("Legend: [VULN] = client could send it — server MUST reject in handler.")
+		reportLine("")
+
+		local issueCounts = {}
+		for path, issueList in pairs(Report.vulnFindings) do
+			for _, issueId in ipairs(issueList) do
+				issueCounts[issueId] = (issueCounts[issueId] or 0) + 1
+			end
+		end
+
+		for issueId, count in pairs(issueCounts) do
+			reportLine(string.format("  %s: %d remotes", issueId, count))
+			if PATCH_ADVICE[issueId] then
+				reportLine("    → " .. PATCH_ADVICE[issueId])
+			end
+		end
+
+		if manipCount == 0 then
+			reportLine("  (no vulnerability flags from client probes)")
+		end
+
+		reportLine("")
+		reportLine("========== GLOBAL PATCH CHECKLIST ==========")
+		reportLine("  • Server-authoritative currency/rewards/inventory")
+		reportLine("  • Validate arg types at handler entry (before deep execution)")
+		reportLine("  • Sanity-check numeric ranges on every number from client")
+		reportLine("  • Per-player rate limits / cooldowns per remote")
+		reportLine("  • Replay protection (nonce/timestamp/idempotency)")
+		reportLine("  • Reject impossible state transitions with preconditions")
+		reportLine("  • Never trust client userid, items, cash, or admin flags")
+		reportLine("")
+
+		-- Save report NOW — before AC's delayed "scan finished" kick (Error 267)
 		reportLine("========== SCAN FINISHED ==========")
-		reportLine("Probed " .. #remotes .. " remotes. Manipulable so far: " .. manipCount)
+		reportLine("Probed " .. #remotes .. " remotes. Flagged: " .. manipCount)
 		reportLine("")
 		reportLine("!!! If you get kicked in a few seconds, that's your AC reacting to")
 		reportLine("!!! the ENTIRE scan (batch kick) — NOT the last remote you probed.")
@@ -624,10 +809,10 @@ local function main()
 
 		if manipCount > 0 then
 			reportLine("")
-			reportLine("========== PATCH THESE ==========")
+			reportLine("========== REMOTES TO PATCH (open in Studio) ==========")
 			for path, info in pairs(Report.allRemotes) do
 				if Report.manipulable[path] then
-					reportLine("• " .. path .. " (" .. info.className .. ")")
+					reportLine("• " .. path .. " (" .. info.className .. ") — " .. tostring(info.status))
 				end
 			end
 		end
