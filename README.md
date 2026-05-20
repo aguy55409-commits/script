@@ -12,7 +12,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/scr
 
 ## 2. Speed exploit test (`speed-test.luau`)
 
-**Fake treadmill mode** — constantly tricks the game into thinking you're on the belt: ghost-touch, spoof `OnTreadmill` attrs, spam `TreadmillSignal` / `CheckGoldTreadmill` every frame. Works **anywhere** on the map. **Scan → START**.
+**Fake treadmill + RakNet replay** (Potassium). **Record** on the treadmill (captures real network packets via `raknet.add_send_hook`). **START** anywhere to `raknet.send` those packets + FireServer backup. Requires executor `raknet` library.
 
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/speed-test.luau", true))()
