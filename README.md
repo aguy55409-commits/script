@@ -12,7 +12,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/scr
 
 ## 2. Speed exploit test (`speed-test.luau`)
 
-**Turbo treadmill** mode: spams `TreadmillSignal` in fast bursts to raise `leaderstats.Speed` faster. Stand on treadmill, set **Ticks/burst** + **Burst delay**, then **Probe → Start**.
+**Universal speed test** — auto-scans any game for speed remotes and stats (leaderstats, WalkSpeed, attributes). **Scan → Probe → Start**. Works on treadmill simulators, RPGs, obbies, etc. No treadmill required.
 
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/speed-test.luau", true))()
