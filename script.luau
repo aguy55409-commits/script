@@ -43,6 +43,7 @@ local function main()
 		lines = {},
 		vulnerableRemotes = {},
 		linkedScripts = {},
+		allRemotes = {},
 	}
 
 	local screenGui
@@ -295,10 +296,65 @@ local function main()
 		end
 	end
 
+	local function listAllRemotes(remotes)
+		reportLine("")
+		reportLine("========== ALL REMOTES IN GAME (" .. #remotes .. ") ==========")
+
+		if #remotes == 0 then
+			reportLine("(none found)")
+			return
+		end
+
+		local eventCount, funcCount = 0, 0
+		for i, remote in ipairs(remotes) do
+			local path = remote:GetFullName()
+			local className = remote.ClassName
+			if className == "RemoteEvent" then
+				eventCount += 1
+			else
+				funcCount += 1
+			end
+
+			Report.allRemotes[path] = {
+				index = i,
+				path = path,
+				className = className,
+				status = "pending",
+			}
+
+			reportLine(string.format("[%d] %s (%s)", i, path, className))
+		end
+
+		reportLine("")
+		reportLine(string.format("Total: %d RemoteEvent, %d RemoteFunction", eventCount, funcCount))
+	end
+
+	local function appendRemoteResults()
+		reportLine("")
+		reportLine("========== REMOTE LIST + PROBE RESULT ==========")
+
+		local paths = {}
+		for path in pairs(Report.allRemotes) do
+			table.insert(paths, path)
+		end
+		table.sort(paths)
+
+		if #paths == 0 then
+			reportLine("(no remotes)")
+			return
+		end
+
+		for _, path in ipairs(paths) do
+			local info = Report.allRemotes[path]
+			reportLine(string.format("[%d] %s (%s) — %s", info.index, path, info.className, info.status))
+		end
+	end
+
 	local function runScan()
 		Report.lines = {}
 		Report.vulnerableRemotes = {}
 		Report.linkedScripts = {}
+		Report.allRemotes = {}
 
 		reportLine("=== EXPLOIT PROBE ===")
 		reportLine("Player: " .. player.Name)
@@ -357,23 +413,33 @@ local function main()
 			reportLine(">>> VULNERABLE: ServerStorage not blocked")
 		end
 
-		-- 4) All remotes
-		reportLine("")
-		reportLine("Firing remotes...")
+		-- 4) List + fire all remotes
 		local remotes = collectRemotes()
-		reportLine("Found " .. #remotes .. " remotes")
+		listAllRemotes(remotes)
 
 		if #remotes == 0 then
+			reportLine("")
 			reportLine("WARNING: This game has ZERO remotes. Nothing to fire.")
 			reportLine("Your game may load remotes later — re-run after joining.")
+		else
+			reportLine("")
+			reportLine("========== FIRING REMOTES (probe) ==========")
 		end
 
-		local sent, blocked = 0, 0
+		local sent, blocked, skipped = 0, 0, 0
 		for i, remote in ipairs(remotes) do
-			if i > REMOTE_SCAN_CAP then
-				break
-			end
 			local path = remote:GetFullName()
+			local entry = Report.allRemotes[path]
+
+			if i > REMOTE_SCAN_CAP then
+				skipped += 1
+				if entry then
+					entry.status = "SKIPPED (over cap " .. REMOTE_SCAN_CAP .. ")"
+				end
+				reportLine("SKIPPED: " .. path)
+				continue
+			end
+
 			local ok, err = pcall(function()
 				if remote:IsA("RemoteEvent") then
 					remote:FireServer(PROBE_TAG, "probe", i)
@@ -381,12 +447,19 @@ local function main()
 					remote:InvokeServer(PROBE_TAG, "probe", i)
 				end
 			end)
+
 			if ok then
 				sent += 1
+				if entry then
+					entry.status = "REACHABLE"
+				end
 				addVulnerable(remote, "FireServer/InvokeServer returned no error")
 				reportLine("REACHABLE: " .. path)
 			else
 				blocked += 1
+				if entry then
+					entry.status = "BLOCKED — " .. tostring(err)
+				end
 				reportLine("BLOCKED: " .. path .. " | " .. tostring(err))
 			end
 			if i % 5 == 0 then
@@ -394,7 +467,9 @@ local function main()
 			end
 		end
 		reportLine("")
-		reportLine(string.format("Result: %d reachable, %d blocked/errors", sent, blocked))
+		reportLine(string.format("Probe: %d reachable, %d blocked, %d skipped", sent, blocked, skipped))
+
+		appendRemoteResults()
 
 		-- 5) Custom path
 		if pathInput and pathInput.Text ~= "" then
@@ -432,7 +507,11 @@ local function main()
 			reportLine("No reachable remotes OR game has no remotes yet.")
 		end
 
-		statusLabel.Text = "Scan done. " .. n .. " vulnerable remotes. Press Copy."
+		local totalRemotes = 0
+		for _ in pairs(Report.allRemotes) do
+			totalRemotes += 1
+		end
+		statusLabel.Text = string.format("Done — %d remotes listed, %d reachable. Press Copy.", totalRemotes, n)
 	end
 
 	local makeBtn = mountGui()
