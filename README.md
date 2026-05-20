@@ -1,45 +1,28 @@
-# Server Exploit Probe (Potassium)
+# Game Security Tools (Potassium)
 
-Client-only script to test **your** anti server-sided exploit protections.  
-**No ServerScriptService.** Execute from **Potassium** while you are in your game.
+For **your** Roblox game. Run in-game with Potassium.
 
-## Loadstring (Potassium)
+## 1. Full security audit (`script.luau`)
+
+Remotes + client script scan + per-remote security checks.
 
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/script.luau", true))()
 ```
 
-With error output:
+## 2. Speed exploit test (`speed-test.luau`)
+
+Constantly tries to raise speed using remotes from your audit (`SetCustomSpeed`, `UpdateSpeed`, etc.) plus client `WalkSpeed`. Use this to verify server blocks fake speed.
 
 ```lua
-local ok, err = pcall(function()
-	loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/script.luau", true))()
-end)
-if not ok then warn("[ExploitProbe] ", err) end
+loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/speed-test.luau", true))()
 ```
 
-## What it tests (from client inject)
+**Controls:** Start speed, add per tick, interval. **Start** / **Stop**.
 
-| Button / test | What it simulates |
-|---------------|-------------------|
-| **Client RemoteEvent** | Executor creates a remote and `FireServer` |
-| **SSS Inject** | Tries to parent a `Script` into `ServerScriptService` |
-| **ServerStorage** | Tries to parent a `Part` into `ServerStorage` |
-| **Invalid args** | Huge / bad payloads on a real remote |
-| **Remote spam** | Rapid `FireServer` burst |
-| **Fire Remotes** | Hits up to 25 `RemoteEvent` / `RemoteFunction` in your game |
-
-## Reading results
-
-- **BLOCKED** (green in log) — your protection stopped it (good).
-- **SENT/OK** (orange) — call went through; check if your AC logged/kicked.
-- If **SSS inject** says "script parented" — that path is **not** blocked.
-
-## Custom remote
-
-Optional text box: `ReplicatedStorage.SomeFolder.SomeRemote`
+If speed only changes briefly or only on your screen → server validation is working. If speed sticks or goes crazy → patch `SetCustomSpeed` / `UpdateSpeed` handlers in Studio.
 
 ## Notes
 
-- Repo must be **public** for HttpGet, or paste `script.luau` directly into Potassium.
-- Only use on **your** game while building anti-exploit.
+- Repo must be **public** for HttpGet, or paste files directly.
+- `[VULN]` on the probe = client *can send* — server must reject in the handler.
