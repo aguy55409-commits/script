@@ -64,6 +64,11 @@ local function getSpeedValue()
 	return nil, nil
 end
 
+local function getSpeedNum()
+	local _, v = getSpeedValue()
+	return parseNum(v)
+end
+
 local function parseNum(v)
 	if type(v) == "number" then
 		return v
@@ -251,7 +256,7 @@ local function runConstant()
 
 	running = true
 	local frame = 0
-	local lastNum = parseNum(getSpeedValue()) or 0
+	local lastNum = getSpeedNum() or 0
 	local lastTime = os.clock()
 	local totalGain = 0
 	local staleFrames = 0
@@ -286,7 +291,7 @@ local function runConstant()
 		end
 
 		local now = os.clock()
-		local cur = parseNum(getSpeedValue())
+		local cur = getSpeedNum()
 		if cur and cur > lastNum then
 			totalGain += cur - lastNum
 			lastNum = cur
@@ -298,7 +303,8 @@ local function runConstant()
 		if now - lastTime >= 0.5 then
 			local perSec = totalGain / math.max(now - lastTime, 0.001)
 			if speedLabel then
-				speedLabel.Text = string.format("Speed = %s | +%.0f/s", tostring(getSpeedValue()), perSec)
+				local _, sv = getSpeedValue()
+				speedLabel.Text = string.format("Speed = %s | +%.0f/s", tostring(sv), perSec)
 			end
 			if rateLabel then
 				rateLabel.Text = string.format("+%.0f/s | frame %d | stale %d", perSec, frame, staleFrames)
@@ -337,27 +343,46 @@ local function runConstant()
 	table.insert(conns, RunService.RenderStepped:Connect(tick))
 end
 
--- GUI
-for _, g in { CoreGui, player:FindFirstChild("PlayerGui") } do
-	local o = g and g:FindFirstChild(GUI_NAME)
-	if o then
-		o:Destroy()
+-- === GUI (must not error or nothing shows) ===
+local sg
+local guiParent = CoreGui
+pcall(function()
+	if gethui then
+		guiParent = gethui()
+	end
+end)
+if not guiParent then
+	guiParent = CoreGui
+end
+
+for _, g in ipairs({ CoreGui, player:FindFirstChild("PlayerGui") }) do
+	if g then
+		local o = g:FindFirstChild(GUI_NAME)
+		if o then
+			o:Destroy()
+		end
 	end
 end
 
-local sg = Instance.new("ScreenGui")
+sg = Instance.new("ScreenGui")
 sg.Name = GUI_NAME
 sg.ResetOnSpawn = false
 sg.IgnoreGuiInset = true
+sg.Enabled = true
 sg.DisplayOrder = 99999
-sg.Parent = (gethui and gethui()) or CoreGui
-pcall(syn.protect_gui, sg)
+sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+sg.Parent = guiParent
+if syn and syn.protect_gui then
+	pcall(syn.protect_gui, sg)
+end
 
 local p = Instance.new("Frame")
 p.Size = UDim2.fromOffset(460, 420)
 p.Position = UDim2.fromScale(0.5, 0.5)
 p.AnchorPoint = Vector2.new(0.5, 0.5)
 p.BackgroundColor3 = Color3.fromRGB(22, 24, 32)
+p.BorderSizePixel = 0
+p.Active = true
 p.Parent = sg
 Instance.new("UICorner", p).CornerRadius = UDim.new(0, 10)
 
@@ -442,6 +467,7 @@ logLabel.TextColor3 = Color3.fromRGB(190, 200, 215)
 logLabel.TextXAlignment = Enum.TextXAlignment.Left
 logLabel.TextWrapped = true
 logLabel.Parent = scroll
+logLabel.Text = "Ready."
 
 local function mkbtn(t, x, w, fn, c)
 	local b = Instance.new("TextButton")
@@ -473,8 +499,8 @@ mkbtn("X", 236, 50, function()
 	sg:Destroy()
 end, Color3.fromRGB(70, 75, 90))
 
-setupRaknet()
-hookSpeedWatchers()
+pcall(setupRaknet)
+pcall(hookSpeedWatchers)
+log("GUI loaded.")
 log(hasRaknet and "RakNet ready" or "No raknet — FireServer only")
-log("START fires treadmill ticks EVERY frame")
-log("Green label = Speed rising | Red = server blocks")
+log("START = constant treadmill ticks")
