@@ -12,7 +12,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/scr
 
 ## 2. Speed exploit test (`speed-test.luau`)
 
-Constantly tries to raise speed using remotes from your audit (`SetCustomSpeed`, `UpdateSpeed`, etc.) plus client `WalkSpeed`. Use this to verify server blocks fake speed.
+Reads your real speed stat (leaderstats/attributes), fires `SetCustomSpeed` + `TreadmillSignal`, and only logs when the stat actually changes. Use **Discover → Probe → Start**.
 
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/speed-test.luau", true))()
