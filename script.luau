@@ -81,6 +81,26 @@ local function main()
 		fire_only = "Don't only check that the remote fired — validate args and game state.",
 	}
 
+	local SCRIPT_PATCH_ADVICE = {
+		readable_source = "Source is copyable — move secrets/logic to ServerScriptService; keep client minimal.",
+		localscript_exposed = "LocalScript runs on client — never trust it for economy/combat/admin.",
+		module_in_rs = "ModuleScript in ReplicatedStorage can be required/hooked — no secret logic there.",
+		fireserver_in_client = "Client calls FireServer — server must validate everything sent.",
+		client_currency = "Currency/cash logic on client — must be server-authoritative only.",
+		client_admin = "Admin/rank checks on client — easy to bypass; verify on server.",
+		client_stats = "WalkSpeed/JumpPower/Humanoid tweaks on client — server should enforce stats.",
+		hook_patterns = "Uses hook/debug patterns — assume exploiters can modify this script.",
+	}
+
+	local SCRIPT_SOURCE_PATTERNS = {
+		{ id = "fireserver_in_client", pat = "FireServer" },
+		{ id = "client_stats", pat = "WalkSpeed" },
+		{ id = "client_stats", pat = "JumpPower" },
+		{ id = "hook_patterns", pat = "getrawmetatable" },
+		{ id = "hook_patterns", pat = "hookfunction" },
+		{ id = "hook_patterns", pat = "getfenv" },
+	}
+
 	-- Remotes matching these are NOT probed (likely to kick / ban / flag you)
 	local SKIP_NAME_KEYWORDS = {
 		"kick",
@@ -159,7 +179,13 @@ local function main()
 		return culprits and culprits[path]
 	end
 
-	local Report = { lines = {}, allRemotes = {}, manipulable = {}, vulnFindings = {} }
+	local Report = {
+		lines = {},
+		allRemotes = {},
+		manipulable = {},
+		vulnFindings = {},
+		clientScripts = {},
+	}
 	local screenGui, statusLabel, reportLabel, scrollFrame, pathInput
 	local lineCount = 0
 	local scanRunning = false
@@ -426,6 +452,187 @@ local function main()
 		return toProbe, skipped
 	end
 
+	local function scanSourcePatterns(sourceLower, issues, issueSet)
+		for _, entry in ipairs(SCRIPT_SOURCE_PATTERNS) do
+			if string.find(sourceLower, string.lower(entry.pat), 1, true) and not issueSet[entry.id] then
+				issueSet[entry.id] = true
+				table.insert(issues, entry.id)
+			end
+		end
+		if string.find(sourceLower, "invokeServer", 1, true) and not issueSet.fireserver_in_client then
+			issueSet.fireserver_in_client = true
+			table.insert(issues, "fireserver_in_client")
+		end
+		if
+			string.find(sourceLower, "cash", 1, true)
+			or string.find(sourceLower, "money", 1, true)
+			or string.find(sourceLower, "coins", 1, true)
+			or string.find(sourceLower, "gems", 1, true)
+			or string.find(sourceLower, "currency", 1, true)
+		then
+			if not issueSet.client_currency then
+				issueSet.client_currency = true
+				table.insert(issues, "client_currency")
+			end
+		end
+		if
+			string.find(sourceLower, "admin", 1, true)
+			or string.find(sourceLower, "moderator", 1, true)
+			or string.find(sourceLower, "rank", 1, true)
+		then
+			if not issueSet.client_admin then
+				issueSet.client_admin = true
+				table.insert(issues, "client_admin")
+			end
+		end
+	end
+
+	local function auditClientScript(inst, location)
+		local path = inst:GetFullName()
+		local ok, source = pcall(function()
+			return inst.Source
+		end)
+
+		if not ok or type(source) ~= "string" or #source == 0 then
+			return nil
+		end
+
+		local issues = {}
+		local issueSet = {}
+
+		table.insert(issues, "readable_source")
+		issueSet.readable_source = true
+
+		if inst:IsA("LocalScript") then
+			table.insert(issues, "localscript_exposed")
+			issueSet.localscript_exposed = true
+		end
+
+		if inst:IsA("ModuleScript") and string.find(path, "ReplicatedStorage", 1, true) then
+			table.insert(issues, "module_in_rs")
+			issueSet.module_in_rs = true
+		end
+
+		scanSourcePatterns(string.lower(source), issues, issueSet)
+
+		local lineCount = 1
+		for _ in string.gmatch(source, "\n") do
+			lineCount += 1
+		end
+
+		return {
+			path = path,
+			className = inst.ClassName,
+			location = location,
+			lines = lineCount,
+			chars = #source,
+			issues = issues,
+		}
+	end
+
+	local function scanClientScripts()
+		reportLine("========== CLIENT SCRIPT AUDIT (player-modifiable) ==========")
+		reportLine("Checks LocalScripts/ModuleScripts executors can read, copy, and hook.")
+		reportLine("Readable Source = exploiter can study/modify/replace client behavior.")
+		reportLine("")
+
+		local roots = {}
+		local function addRoot(name, inst)
+			if inst then
+				table.insert(roots, { name = name, inst = inst })
+			end
+		end
+
+		addRoot("ReplicatedStorage", ReplicatedStorage)
+		addRoot("StarterGui", game:GetService("StarterGui"))
+		addRoot("StarterPack", game:GetService("StarterPack"))
+		addRoot("Workspace", workspace)
+
+		local starterPlayer = game:GetService("StarterPlayer")
+		if starterPlayer then
+			addRoot("StarterPlayer", starterPlayer)
+		end
+
+		addRoot("PlayerGui", player:FindFirstChild("PlayerGui"))
+		addRoot("PlayerScripts", player:FindFirstChild("PlayerScripts"))
+		addRoot("Character", player.Character)
+
+		local SCRIPT_CAP = 120
+		local scanned, flagged, readable = 0, 0, 0
+
+		for _, root in ipairs(roots) do
+			reportLine("--- " .. root.name .. " ---")
+			local rootCount = 0
+
+			pcall(function()
+				for _, inst in ipairs(root.inst:GetDescendants()) do
+					if inst:IsA("LocalScript") or inst:IsA("ModuleScript") then
+						if scanned >= SCRIPT_CAP then
+							break
+						end
+						scanned += 1
+						rootCount += 1
+
+						local audit = auditClientScript(inst, root.name)
+						if audit then
+							readable += 1
+							Report.clientScripts[audit.path] = audit
+
+							if #audit.issues > 1 then
+								flagged += 1
+								reportLine(string.format("  [VULN] %s (%s) — %d lines", audit.path, audit.className, audit.lines))
+								for _, issueId in ipairs(audit.issues) do
+									reportLine("         • " .. issueId)
+								end
+								reportLine("         PATCH:")
+								for _, issueId in ipairs(audit.issues) do
+									if SCRIPT_PATCH_ADVICE[issueId] then
+										reportLine("           - " .. SCRIPT_PATCH_ADVICE[issueId])
+									end
+								end
+							else
+								reportLine(
+									string.format(
+										"  [ok]   %s (%s) — readable but no risky patterns",
+										audit.path,
+										audit.className
+									)
+								)
+							end
+						end
+					end
+				end
+			end)
+
+			if rootCount == 0 then
+				reportLine("  (no LocalScripts/ModuleScripts)")
+			end
+		end
+
+		reportLine("")
+		reportLine(string.format("Scripts scanned: %d | Readable: %d | Flagged risky: %d", scanned, readable, flagged))
+		reportLine("")
+		reportLine("========== CLIENT SCRIPT PATCH RULES ==========")
+		reportLine("  • Economy/combat/admin ONLY in ServerScriptService")
+		reportLine("  • Client scripts: UI + input only, FireServer with minimal args")
+		reportLine("  • Never store secrets in ReplicatedStorage ModuleScripts")
+		reportLine("  • Assume readable LocalScripts WILL be modified by executors")
+		reportLine("")
+
+		if flagged > 0 then
+			reportLine("========== PRIORITY CLIENT SCRIPTS TO HARDEN ==========")
+			for path, audit in pairs(Report.clientScripts) do
+				if #audit.issues > 1 then
+					reportLine("• " .. path)
+				end
+			end
+			reportLine("")
+		end
+
+		flushDisplay(false)
+		copyText()
+	end
+
 	local function mountGui()
 		screenGui = Instance.new("ScreenGui")
 		screenGui.Name = GUI_NAME
@@ -456,7 +663,7 @@ local function main()
 		title.TextSize = 17
 		title.TextColor3 = Color3.fromRGB(255, 255, 255)
 		title.TextXAlignment = Enum.TextXAlignment.Left
-		title.Text = "Remote Manipulation Probe"
+		title.Text = "Game Security Audit"
 		title.Parent = panel
 
 		statusLabel = Instance.new("TextLabel")
@@ -468,7 +675,7 @@ local function main()
 		statusLabel.TextWrapped = true
 		statusLabel.TextColor3 = Color3.fromRGB(160, 210, 255)
 		statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-		statusLabel.Text = "Security audit per remote. Report copies when done (batch kick may follow)."
+		statusLabel.Text = "Audits client scripts + remotes. Report copies when done."
 		statusLabel.Parent = panel
 
 		pathInput = Instance.new("TextBox")
@@ -591,9 +798,10 @@ local function main()
 		Report.allRemotes = {}
 		Report.manipulable = {}
 		Report.vulnFindings = {}
+		Report.clientScripts = {}
 		lineCount = 0
 
-		reportLine("=== REMOTE SECURITY AUDIT ===")
+		reportLine("=== GAME SECURITY AUDIT (remotes + client scripts) ===")
 		reportLine("Player: " .. player.Name .. " | PlaceId: " .. game.PlaceId)
 		reportLine("Speed: " .. activeConfig.label)
 		reportLine("Delay: " .. activeConfig.delay .. "s | Timeout: " .. activeConfig.timeout .. "s per remote")
@@ -609,6 +817,16 @@ local function main()
 		reportLine("NOTE: Kick AFTER scan ends = delayed batch kick (AC counted all probes).")
 		reportLine("      This script does NOT call Kick. Report copies when scan finishes.")
 		reportLine("")
+
+		scanClientScripts()
+
+		if not player.Parent then
+			reportLine("Kicked during client script scan — partial report copied.")
+			copyText()
+			scanRunning = false
+			flushDisplay(true)
+			return
+		end
 
 		local remotes, skippedRemotes = collectRemotes()
 
