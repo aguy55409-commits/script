@@ -22,17 +22,22 @@ end
 
 local GUI_NAME = "SpeedExploitTest"
 
--- From your audit — add more paths if you find them
+-- ONLY real speed handlers — NOT gamepass Prompt* remotes (those open purchase UI)
 local SPEED_REMOTES = {
-	{ path = "ReplicatedStorage.Remotes.SetCustomSpeed", kind = "event", primary = true },
-	{ path = "ReplicatedStorage.Remotes.UpdateSpeed", kind = "event" },
-	{ path = "ReplicatedStorage.Remotes.PromptSpeedBoost", kind = "event" },
-	{ path = "ReplicatedStorage.Remotes.Prompt10MSpeed", kind = "event" },
-	{ path = "ReplicatedStorage.Remotes.Prompt50MSpeed", kind = "event" },
-	{ path = "ReplicatedStorage.Remotes.Prompt150KSpeed", kind = "event" },
-	{ path = "ReplicatedStorage.Remotes.Prompt500MSpeed", kind = "event" },
-	{ path = "ReplicatedStorage.Remotes.Prompt1MSpeed", kind = "event" },
-	{ path = "ReplicatedStorage.Remotes.Prompt1BSpeed", kind = "event" },
+	{ path = "ReplicatedStorage.Remotes.SetCustomSpeed", name = "SetCustomSpeed" },
+	{ path = "ReplicatedStorage.Remotes.UpdateSpeed", name = "UpdateSpeed" },
+}
+
+-- Names we never touch (monetization / UI / admin)
+local SKIP_NAME_PATTERNS = {
+	"prompt",
+	"gamepass",
+	"purchase",
+	"product",
+	"devproduct",
+	"robux",
+	"shop",
+	"buy",
 }
 
 local running = false
@@ -65,18 +70,23 @@ local function resolvePath(path)
 	return obj
 end
 
+local function shouldSkipRemoteName(name)
+	local lower = string.lower(name)
+	for _, pat in ipairs(SKIP_NAME_PATTERNS) do
+		if string.find(lower, pat, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
 local function fireSpeedRemote(remoteInfo, speed)
 	local remote = resolvePath(remoteInfo.path)
-	if remoteInfo.kind == "event" and remote:IsA("RemoteEvent") then
-		-- Try common handler shapes your game might use
+	if remote:IsA("RemoteEvent") then
 		remote:FireServer(speed)
-		remote:FireServer("speed", speed)
-		remote:FireServer(speed, player.UserId)
 		return true
 	elseif remote:IsA("RemoteFunction") then
-		pcall(function()
-			remote:InvokeServer(speed)
-		end)
+		remote:InvokeServer(speed)
 		return true
 	end
 	return false
@@ -120,15 +130,15 @@ local function runSpeedLoop()
 		tickCount += 1
 		log(string.format("--- tick %d | target speed: %s ---", tickCount, speed))
 
-		-- 1) Primary game remotes (server must validate)
+		-- 1) Real speed remotes only (not gamepass prompts)
 		for _, info in ipairs(SPEED_REMOTES) do
 			local ok, err = pcall(function()
 				fireSpeedRemote(info, speed)
 			end)
 			if ok then
-				log("  Fired: " .. info.path)
+				log(string.format("  Fired %s(%s)", info.name, speed))
 			else
-				log("  FAIL: " .. info.path .. " — " .. tostring(err))
+				log(string.format("  FAIL %s — %s", info.name, tostring(err)))
 			end
 		end
 
@@ -195,7 +205,7 @@ statusLabel.TextSize = 12
 statusLabel.TextWrapped = true
 statusLabel.TextColor3 = Color3.fromRGB(160, 210, 255)
 statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-statusLabel.Text = "Press Start — fires SetCustomSpeed / UpdateSpeed with rising values."
+statusLabel.Text = "Only SetCustomSpeed + UpdateSpeed (no gamepass Prompt remotes)."
 statusLabel.Parent = panel
 
 local function numBox(label, y, default)
@@ -279,4 +289,7 @@ btn("Close", 204, 90, function()
 	screenGui:Destroy()
 end, Color3.fromRGB(80, 85, 100))
 
-log("Loaded. Targets SetCustomSpeed + UpdateSpeed from your audit.")
+log("Loaded. ONLY tests:")
+log("  • ReplicatedStorage.Remotes.SetCustomSpeed")
+log("  • ReplicatedStorage.Remotes.UpdateSpeed")
+log("Skipped: Prompt*Speed (gamepass purchase prompts).")
