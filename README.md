@@ -6,19 +6,27 @@ For **your** Roblox game. Run in-game with Potassium.
 
 Legit aimbot, rage orbit, ESP, triggerbot. Menu: **RightShift** / **Insert**.
 
-**One-liner (in game):**
+**Private repo (recommended)** — `game:HttpGet` cannot read private GitHub files. Use a PAT:
+
+```lua
+local T = "YOUR_GITHUB_TOKEN" -- repo Contents: Read
+local U = "https://api.github.com/repos/aguy55409-commits/script/contents/cobalt-redux.luau?ref=main"
+local R = (syn and syn.request or http and http.request or request)({
+	Url = U,
+	Headers = { Authorization = "Bearer " .. T, Accept = "application/vnd.github.raw", ["User-Agent"] = "CobaltRedux" },
+})
+loadstring(R.Body)()
+```
+
+**Public repo one-liner:**
 
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/cobalt-redux.luau", true))()
 ```
 
-**Or use the loader file** (same URL, with error handling):
+**Loader file** — open `cobalt-redux-loadstring.luau`, paste your token into `GITHUB_TOKEN`, then execute that file in your executor (do not HttpGet the loader from a private repo).
 
-```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/cobalt-redux-loadstring.luau", true))()
-```
-
-**Raw script URL:** `https://raw.githubusercontent.com/aguy55409-commits/script/main/cobalt-redux.luau`
+**No token?** Load `cobalt-redux.luau` directly from your executor file browser.
 
 ---
 
@@ -44,5 +52,5 @@ If speed only changes briefly or only on your screen → server validation is wo
 
 ## Notes
 
-- Repo must be **public** for HttpGet, or paste files directly.
+- Repo is **private** — use a GitHub PAT or load the `.luau` file locally. Public repos can use plain `HttpGet`.
 - `[VULN]` on the probe = client *can send* — server must reject in the handler.
