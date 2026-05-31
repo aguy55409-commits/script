@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+*.luau.bak
+_build_*.py

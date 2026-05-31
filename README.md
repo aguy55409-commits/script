@@ -2,6 +2,26 @@
 
 For **your** Roblox game. Run in-game with Potassium.
 
+## Cobalt Redux — combat module (`cobalt-redux.luau`)
+
+Legit aimbot, rage orbit, ESP, triggerbot. Menu: **RightShift** / **Insert**.
+
+**One-liner (in game):**
+
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/cobalt-redux.luau", true))()
+```
+
+**Or use the loader file** (same URL, with error handling):
+
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/aguy55409-commits/script/main/cobalt-redux-loadstring.luau", true))()
+```
+
+**Raw script URL:** `https://raw.githubusercontent.com/aguy55409-commits/script/main/cobalt-redux.luau`
+
+---
+
 ## 1. Full security audit (`script.luau`)
 
 Remotes + client script scan + per-remote security checks.
