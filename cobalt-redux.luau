@@ -178,7 +178,8 @@ local DisabledBarriers = {}
 local OrbitAngle = 0
 local OrbitTarget = nil
 local LastCombatCF = nil
-local RageCamWasThirdPerson = nil
+local SavedOrbitZoomMin = nil
+local SavedOrbitZoomMax = nil
 local LastFire = 0
 local LastCombat = 0
 local DefaultFov = 70
@@ -671,7 +672,7 @@ function aimAtTarget(part, snap)
     local targetPos = part.Position
     local instant = snap or rageActive() or St.silentAim
 
-    if St.thirdPerson then
+    local function aimViaMouse()
         local sp, on = cam:WorldToViewportPoint(targetPos)
         if not on or sp.Z < 0 then return false end
         local ap = getAimPoint()
@@ -682,6 +683,15 @@ function aimAtTarget(part, snap)
         end
         local sens = math.max(0.05, St.smooth) * 6
         return sendMouseDelta(dx / sens, dy / sens, ap.X + dx / sens, ap.Y + dy / sens)
+    end
+
+    -- Rage never snaps camera CFrame — that breaks mouse look / orbit view
+    if rageActive() then
+        return aimViaMouse()
+    end
+
+    if St.thirdPerson then
+        return aimViaMouse()
     end
 
     local goal = CFrame.new(cam.CFrame.Position, targetPos)
@@ -1430,10 +1440,6 @@ function applySettings(data, opts)
     applyNumField(data, "camFov", 30, 120)
     applyBoolField(data, "selfChams")
     if type(data.selfChamColor) == "table" then St.selfChamColor = deserializeColor(data.selfChamColor) end
-    applyBoolField(data, "walkSpeed", Ref.walkToggle)
-    applyNumField(data, "walkSpeedVal", 16, 200)
-    applyBoolField(data, "jumpPower", Ref.jumpToggle)
-    applyNumField(data, "jumpPowerVal", 20, 200)
     applyBoolField(data, "fly", Ref.flyToggle)
     applyNumField(data, "flySpeed", 20, 400)
     applyBoolField(data, "noclip", Ref.noclipToggle)
@@ -1628,8 +1634,6 @@ function updateMovement(dt)
     local hum = getHum(char)
     local root = getRoot(char)
     if not hum or not root then return end
-    if St.walkSpeed then hum.WalkSpeed = St.walkSpeedVal else hum.WalkSpeed = DefaultWalkSpeed end
-    if St.jumpPower then hum.JumpPower = St.jumpPowerVal else hum.JumpPower = DefaultJumpPower end
     if St.noclip then setNoclip(true) else setNoclip(false) end
     if St.fly then
         local cam = workspace.CurrentCamera
@@ -1910,32 +1914,36 @@ function clearOrbitTarget()
     OrbitTarget = nil
     OrbitAngle = 0
     LastCombatCF = nil
+    disableRageOrbitView()
 end
 
-function beginRageOrbitView()
-    if RageCamWasThirdPerson == nil then
-        RageCamWasThirdPerson = St.thirdPerson
+function enableRageOrbitView()
+    local hum = getHum(getChar(LocalPlayer))
+    local cam = workspace.CurrentCamera
+    if hum then
+        if SavedOrbitZoomMin == nil then
+            SavedOrbitZoomMin = hum.CameraMinZoomDistance
+            SavedOrbitZoomMax = hum.CameraMaxZoomDistance
+        end
+        local dist = math.max(St.thirdPersonDist, 10)
+        hum.CameraMinZoomDistance = dist
+        hum.CameraMaxZoomDistance = dist
+    end
+    if cam then
+        cam.CameraType = Enum.CameraType.Custom
+        if hum then cam.CameraSubject = hum end
     end
 end
 
-function endRageOrbitView()
-    if RageCamWasThirdPerson ~= nil then
-        St.thirdPerson = RageCamWasThirdPerson
-        RageCamWasThirdPerson = nil
+function disableRageOrbitView()
+    local hum = getHum(getChar(LocalPlayer))
+    if hum and SavedOrbitZoomMin ~= nil then
+        hum.CameraMinZoomDistance = SavedOrbitZoomMin
+        hum.CameraMaxZoomDistance = SavedOrbitZoomMax
+        SavedOrbitZoomMin = nil
+        SavedOrbitZoomMax = nil
     end
     restoreCamera()
-end
-
-function updateRageOrbitCamera()
-    if not rageActive() or not St.desyncOrbit then return end
-    local cam = workspace.CurrentCamera
-    local root = getRoot(getChar(LocalPlayer))
-    if not cam or not root then return end
-    local dist = math.max(St.thirdPersonDist, 10)
-    cam.CameraType = Enum.CameraType.Scriptable
-    local back = root.CFrame.LookVector * -dist
-    local focus = root.Position + Vector3.new(0, 1.2, 0)
-    cam.CFrame = CFrame.new(focus + Vector3.new(0, 2.2, 0) + back, focus)
 end
 
 function restoreCamera()
@@ -1957,16 +1965,16 @@ end
 
 function updateOrbit(dt)
     if not rageActive() then
-        endRageOrbitView()
+        disableRageOrbitView()
         return
     end
 
     if not St.desyncOrbit then
-        endRageOrbitView()
+        disableRageOrbitView()
         return
     end
 
-    beginRageOrbitView()
+    enableRageOrbitView()
 
     local myRoot = getRoot(getChar(LocalPlayer))
     if not myRoot then return end
@@ -2108,7 +2116,7 @@ end
 function unload()
     St.running = false
     clearOrbitTarget()
-    endRageOrbitView()
+    disableRageOrbitView()
     restoreBarriers()
     clearAllEsp()
     resetAllVisuals()
@@ -6278,7 +6286,7 @@ Ref.rageBanner.Size = UDim2.new(1, -4, 0, 32)
 
 local rageGuide = makeGroupbox(rageStack, "Quick Start")
 label(rageGuide, "1) Enable Ragebot — locks ONE target, orbits + wallbang", 13, nil, 7)
-label(rageGuide, "2) Press X — third-person orbit cam shows you circling them", 13, nil, 7)
+label(rageGuide, "2) Press X — orbit locked target (third-person zoom, normal camera)", 13, nil, 7)
 label(rageGuide, "Stays on same target until they die, then picks next", 13, nil, 7)
 
 local rageKeys = makeGroupbox(rageStack, "Rage Keybinds")
@@ -6320,7 +6328,7 @@ Ref.ragebotToggle = makeToggle(rageFeatures, "Enable Ragebot", function(v)
         St.rageToggled = false
         St.rageHold = false
         clearOrbitTarget()
-        endRageOrbitView()
+        disableRageOrbitView()
     end
 end, St.ragebot)
 
@@ -6336,7 +6344,7 @@ makeToggle(rageFeatures, "Orbit Camera (see yourself circle target)", function(v
     St.desyncOrbit = v
     if not v then
         clearOrbitTarget()
-        endRageOrbitView()
+        disableRageOrbitView()
     end
 end, St.desyncOrbit)
 
@@ -6545,16 +6553,7 @@ makeButton(worldBox, "Preset: Muted", applyWorldPreset_Muted)
 
 -- ── Move tab ──
 local moveBox = makeGroupbox(moveStack, "Movement")
-Ref.walkToggle = makeToggle(moveBox, "WalkSpeed Override", function(v) St.walkSpeed = v end, St.walkSpeed)
-makeSlider(moveBox, "WalkSpeed", {
-    min = 16, max = 200, get = function() return St.walkSpeedVal end,
-    set = function(v) St.walkSpeedVal = v end, fmt = function(v) return math.floor(v) end,
-})
-Ref.jumpToggle = makeToggle(moveBox, "Jump Power Override", function(v) St.jumpPower = v end, St.jumpPower)
-makeSlider(moveBox, "Jump Power", {
-    min = 20, max = 200, get = function() return St.jumpPowerVal end,
-    set = function(v) St.jumpPowerVal = v end, fmt = function(v) return math.floor(v) end,
-})
+label(moveBox, "WalkSpeed / JumpPower removed — use game defaults", 12, nil, 7)
 Ref.flyToggle = makeToggle(moveBox, "Fly (WASD + Space/Ctrl)", function(v) St.fly = v end, St.fly)
 makeSlider(moveBox, "Fly Speed", {
     min = 20, max = 400, get = function() return St.flySpeed end,
@@ -6745,7 +6744,7 @@ connect(UserInputService.InputBegan, function(input, gp)
                 end
             else
                 clearOrbitTarget()
-                endRageOrbitView()
+                disableRageOrbitView()
             end
         elseif St.rageMode == 3 then
             St.rageHold = true
@@ -6770,7 +6769,7 @@ connect(UserInputService.InputEnded, function(input, gp)
     if input.KeyCode == St.rageKey and St.rageMode == 3 then
         St.rageHold = false
         clearOrbitTarget()
-        endRageOrbitView()
+        disableRageOrbitView()
         updateStatusLabels()
     end
 end)
@@ -6832,7 +6831,6 @@ connect(RunService.RenderStepped, function(dt)
 
     combatStep()
     silentAimStep()
-    updateRageOrbitCamera()
     applyVisualEffects()
 
     if St.showFov then
@@ -6852,9 +6850,7 @@ connect(RunService.RenderStepped, function(dt)
     camTick = camTick + dt
     if camTick >= 1 / 30 then
         camTick = 0
-        if rageActive() and St.desyncOrbit then
-            -- orbit view: updateRageOrbitCamera on RenderStepped
-        elseif St.thirdPerson then
+        if St.thirdPerson and not (rageActive() and St.desyncOrbit) then
             updateThirdPerson()
         else
             local cam = workspace.CurrentCamera
