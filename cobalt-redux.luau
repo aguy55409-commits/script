@@ -1,7 +1,7 @@
 --[[
-    Cobalt Redux — Semi-blatant combat module (Randomizer Redux)
+    Cobalt Redux — Legit combat module (Randomizer Redux)
     GUI: Linoria-style linear init (loads immediately)
-    Legit: Camera aim + mouse fallback | Rage: auto-fire wallbang orbit
+    Legit: Camera aim + silent wallbang (raycast-only, no teleport)
 ]]
 
 local Players = game:GetService("Players")
@@ -13,6 +13,7 @@ local VirtualUser = game:GetService("VirtualUser")
 local HttpService = game:GetService("HttpService")
 local Lighting = game:GetService("Lighting")
 local GuiService = game:GetService("GuiService")
+local CollectionService = game:GetService("CollectionService")
 
 local VirtualInputManager = nil
 pcall(function()
@@ -55,6 +56,13 @@ local AIM_MODES = { "Always", "Toggle", "Hold" }
 local HIT_PARTS = { "Head", "UpperTorso", "HumanoidRootPart", "LowerTorso" }
 local TARGET_PRIORITIES = { "Crosshair", "Distance" }
 local MAP_FOLDERS = { "Map", "Terrain", "Buildings", "Geometry", "KillParts", "Barriers", "Obstacles" }
+local WALLBANG_IGNORE_TAGS = {
+    "RANGED_CASTER_IGNORE_LIST",
+    "RANGED_IGNORE_LIST",
+    "ProjectileIgnore",
+    "CastIgnore",
+    "WallbangIgnore",
+}
 local BARRIER_KEYWORDS = { "kill", "death", "void", "lava", "barrier", "deadzone", "oob", "hurt", "damage" }
 local BARRIER_FOLDERS = { "Map", "KillParts", "Barriers", "Terrain" }
 local HIDE_KEYS = { Enum.KeyCode.RightShift, Enum.KeyCode.Insert }
@@ -102,19 +110,12 @@ local St = {
     teamCheck = false,
     targetPriority = 1,
     rebinding = nil,
-    -- Rage
-    ragebot = false,
-    rageKey = Enum.KeyCode.X,
-    rageMode = 2,
-    rageToggled = false,
-    rageHold = false,
+    -- Wallbang (silent raycast redirect)
     wallbang = false,
-    wallbangDepth = 5,
-    autoFire = false,
-    desyncOrbit = false,
-    orbitRadius = 14,
-    orbitSpeed = 6,
-    barrierDisable = false,
+    wallbangKey = Enum.KeyCode.Q,
+    wallbangMode = 2,
+    wallbangToggled = false,
+    wallbangHold = false,
     -- ESP
     espEnabled = false,
     espBoxes = false,
@@ -150,11 +151,6 @@ local St = {
     espVisColor = false,
     espVisibleCol = Color3.fromRGB(80, 255, 120),
     espHiddenCol = Color3.fromRGB(255, 80, 80),
-    -- Rage extras
-    rageSpin = false,
-    rageSpinSpeed = 18,
-    rageSpeedBoost = false,
-    rageSpeedMult = 2.5,
     -- Movement
     walkSpeed = false,
     walkSpeedVal = 24,
@@ -175,12 +171,6 @@ local Ref = {}
 local Connections = {}
 local ThemeParts = { toggles = {}, fills = {}, highlights = {}, tabs = {} }
 local EspStore = {}
-local DisabledBarriers = {}
-local OrbitAngle = 0
-local OrbitTarget = nil
-local LastCombatCF = nil
-local SavedOrbitZoomMin = nil
-local SavedOrbitZoomMax = nil
 local LastFire = 0
 local LastCombat = 0
 local DefaultFov = 70
@@ -218,13 +208,13 @@ local DefaultGravity = workspace.Gravity
 local SpinAngle = 0
 local LastTrigger = 0
 local WallbangTargetPart = nil
-local WallbangSavedRootCF = nil
-local WallbangSavedCamCF = nil
-local WallbangVoidNoclip = false
-local WallbangInVoid = false
+local WallbangLockedPlayer = nil
+local WallbangHookUntil = 0
 local WallbangPlayerMouse = nil
 local WallbangHookInstalled = false
-local OldWallbangIndex = nil
+local OldWallbangNamecall = nil
+local WallbangCheckCaller = checkcaller or function() return false end
+local WallbangGetNamecallMethod = getnamecallmethod or function() return "" end
 local NoclipParts = {}
 local Stats = { fps = 0, fpsTick = 0, start = tick() }
 local saveProfile, loadProfile, deleteProfile, refreshProfileList
@@ -232,7 +222,7 @@ local exportProfileToClipboard, importProfileFromClipboard
 local applyVisualEffects, resetAllVisuals, syncVisualControls
 local serializeSettings, applySettings
 local updatePlayerList, rebuildPlayerList
-local updateMovement, updateRageExtras
+local updateMovement
 local triggerbotStep, notify, applyAccent, getThemeName
 
 
@@ -480,7 +470,7 @@ function isMouseBindInput(input)
 end
 
 function handleAimBindBegan()
-    if not St.aimbot or rageActive() then return end
+    if not St.aimbot then return end
     if St.aimMode == 2 then
         St.aimToggled = not St.aimToggled
     elseif St.aimMode == 3 then
@@ -496,8 +486,63 @@ function handleAimBindEnded()
     end
 end
 
+function wallbangActive()
+    if not St.wallbang then return false end
+    if St.wallbangMode == 1 then return true end
+    if St.wallbangMode == 2 then return St.wallbangToggled end
+    if St.wallbangMode == 3 then return St.wallbangHold end
+    return false
+end
+
+
+function lockWallbangTarget()
+    local t = bestTarget()
+    if t then
+        WallbangLockedPlayer = t
+        notify("Wallbang locked: " .. t.DisplayName, Color3.fromRGB(120, 200, 255))
+        return t
+    end
+    notify("No target in FOV for wallbang", Color3.fromRGB(255, 120, 80))
+    return nil
+end
+
+function handleWallbangBindBegan()
+    if not St.wallbang or St.wallbangMode ~= 2 then return end
+    St.wallbangToggled = not St.wallbangToggled
+    if St.wallbangToggled then
+        if not lockWallbangTarget() then
+            St.wallbangToggled = false
+        end
+    else
+        clearWallbangShot()
+    end
+    updateStatusLabels()
+end
+
+function refreshWallbangHoldState()
+    if not St.wallbang or St.wallbangMode ~= 3 then return end
+    local down = UserInputService:IsKeyDown(St.wallbangKey)
+    if down == St.wallbangHold then return end
+    St.wallbangHold = down
+    if down then
+        lockWallbangTarget()
+    else
+        clearWallbangShot()
+    end
+    updateStatusLabels()
+end
+
+function wallbangStatusText()
+    if not St.wallbang then return "OFF", Color3.fromRGB(160, 160, 160) end
+    if WallbangLockedPlayer and isEnemy(WallbangLockedPlayer) then
+        return "LOCK", Color3.fromRGB(120, 200, 255)
+    end
+    if wallbangActive() then return "ON", Color3.fromRGB(80, 255, 120) end
+    return "ARMED", Color3.fromRGB(200, 200, 120)
+end
+
 function refreshAimHoldState()
-    if not St.aimbot or St.aimMode ~= 3 or rageActive() then return end
+    if not St.aimbot or St.aimMode ~= 3 then return end
     if St.aimBindType == "mouse" then
         St.aimHold = UserInputService:IsMouseButtonPressed(St.aimMouse)
     else
@@ -563,15 +608,10 @@ function isFiring()
 end
 
 function rageActive()
-    if not St.ragebot then return false end
-    if St.rageMode == 1 then return true end
-    if St.rageMode == 2 then return St.rageToggled end
-    if St.rageMode == 3 then return St.rageHold end
     return false
 end
 
 function aimActive()
-    if rageActive() then return true end
     if not St.aimbot then return false end
     if St.aimMode == 1 then return true end
     if St.aimMode == 2 then return St.aimToggled end
@@ -580,7 +620,6 @@ function aimActive()
 end
 
 function canAim()
-    if rageActive() then return true end
     if not aimActive() then return false end
     if St.aimOnShoot and not isShooting() then return false end
     return true
@@ -588,427 +627,268 @@ end
 
 function wallbangShootActive()
     if not St.wallbang then return false end
-    if isFiring() then return true end
-    if rageActive() and St.autoFire then return true end
-    return false
+    return isFiring()
 end
 
-function wallbangVoidActive()
-    return St.wallbang and WallbangSavedRootCF ~= nil
-end
-
-function shouldWallbangIgnoreMap()
-    return wallbangShootActive() or (rageActive() and St.wallbang)
-end
-
-function visibilityIgnoreList()
-    local t = {}
-    if LocalPlayer.Character then
-        t[#t + 1] = LocalPlayer.Character
-    end
-    local cam = workspace.CurrentCamera
-    if cam then
-        t[#t + 1] = cam
-    end
-    return t
-end
-
-function ignoreList()
-    local t = visibilityIgnoreList()
-    if shouldWallbangIgnoreMap() then
-        for _, n in ipairs(MAP_FOLDERS) do
-            local f = workspace:FindFirstChild(n)
-            if f then t[#t + 1] = f end
-        end
-    end
-    return t
-end
-
-function isPhysicallyVisible(origin, part, char)
-    if not part or not char then return false end
-
-    local checkParts = { part }
-    local head = char:FindFirstChild("Head")
-    if head and head ~= part then
-        checkParts[#checkParts + 1] = head
-    end
-    local root = getRoot(char)
-    if root and root ~= part and root ~= head then
-        checkParts[#checkParts + 1] = root
-    end
-
-    local filter = visibilityIgnoreList()
-    for _, checkPart in ipairs(checkParts) do
-        local p = RaycastParams.new()
-        p.FilterType = Enum.RaycastFilterType.Exclude
-        p.FilterDescendantsInstances = filter
-        p.IgnoreWater = true
-        local delta = checkPart.Position - origin
-        if delta.Magnitude > 0.05 then
-            local hit = workspace:Raycast(origin, delta, p)
-            if not hit or hit.Instance:IsDescendantOf(char) then
-                return true
-            end
-        end
-    end
-    return false
-end
-
-function isVisible(origin, part, char)
-    if not St.visibleCheck then return true end
-    return isPhysicallyVisible(origin, part, char)
-end
-
-function screenDist(part)
-    local cam = workspace.CurrentCamera
-    if not cam or not part then return math.huge end
-    local sp, on = cam:WorldToViewportPoint(part.Position)
-    if not on or sp.Z < 0 then return math.huge end
-    local mp = mousePos()
-    return (Vector2.new(sp.X, sp.Y) - Vector2.new(mp.X, mp.Y)).Magnitude
-end
-
-function worldDist(plr, origin)
-    local root = getRoot(getChar(plr))
-    if not root or not origin then return math.huge end
-    return (root.Position - origin).Magnitude
-end
-
-function bestTarget()
-    local cam = workspace.CurrentCamera
-    if not cam then return nil end
-    local myRoot = getRoot(getChar(LocalPlayer))
-    local origin = myRoot and myRoot.Position or cam.CFrame.Position
-    local maxFov = rageActive() and math.huge or St.fov
-    local needVis = St.visibleCheck and not rageActive() and not wallbangShootActive()
-    local useDist = St.targetPriority == 2 or rageActive()
-
-    if St.priorityUserId then
-        local pri = Players:GetPlayerByUserId(St.priorityUserId)
-        if pri and isEnemy(pri) then
-            local part = getHitPart(getChar(pri))
-            if part then
-                local sd = rageActive() and 0 or screenDist(part)
-                if sd <= maxFov and (not needVis or isVisible(cam.CFrame.Position, part, getChar(pri))) then
-                    return pri
-                end
-            end
-        end
-    end
-
-    local best, bestScore = nil, math.huge
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if isEnemy(plr) then
-            local part = getHitPart(getChar(plr))
-            if part then
-                local sd = screenDist(part)
-                if sd <= maxFov then
-                    if not needVis or isVisible(cam.CFrame.Position, part, getChar(plr)) then
-                        local score = useDist and worldDist(plr, origin) or sd
-                        if score < bestScore then
-                            bestScore = score
-                            best = plr
-                        end
-                    end
-                end
-            end
-        end
-    end
-    return best
-end
-
-
-function getAimPoint()
-    return viewportMouse()
-end
-
-function sendMouseDelta(dx, dy, absX, absY)
-    local moved = false
-    pcall(function()
-        if mouseMoveRel then
-            mouseMoveRel(dx, dy)
-            moved = true
-        elseif mouseMoveAbs and absX and absY then
-            local sx, sy = viewportToScreen(absX, absY)
-            mouseMoveAbs(sx, sy)
-            moved = true
-        elseif VirtualInputManager then
-            local mp = screenMouse()
-            VirtualInputManager:SendMouseMoveEvent(mp.X + dx, mp.Y + dy, game)
-            moved = true
-        end
-    end)
-    return moved
-end
-
-function aimAtTarget(part, snap)
-    local cam = workspace.CurrentCamera
-    if not cam or not part then return false end
-    local targetPos = part.Position
-    local instant = snap or rageActive()
-
-    local function aimViaMouse()
-        local sp, on = cam:WorldToViewportPoint(targetPos)
-        if not on or sp.Z < 0 then return false end
-        local ap = getAimPoint()
-        local dx, dy = sp.X - ap.X, sp.Y - ap.Y
-        if math.abs(dx) < 0.25 and math.abs(dy) < 0.25 then return true end
-        if instant then
-            return sendMouseDelta(dx, dy, sp.X, sp.Y)
-        end
-        local sens = math.max(0.05, St.smooth) * 6
-        return sendMouseDelta(dx / sens, dy / sens, ap.X + dx / sens, ap.Y + dy / sens)
-    end
-
-    if rageActive() then
-        if not St.desyncOrbit then
-            cam.CFrame = CFrame.new(cam.CFrame.Position, targetPos)
-        end
-        aimViaMouse()
-        return true
-    end
-
-    if St.thirdPerson then
-        return aimViaMouse()
-    end
-
-    local goal = CFrame.new(cam.CFrame.Position, targetPos)
-    if instant then
-        cam.CFrame = goal
-    else
-        local alpha = clamp(1 - St.smooth, 0.08, 1)
-        cam.CFrame = cam.CFrame:Lerp(goal, alpha)
-    end
-
-    local sp, on = cam:WorldToViewportPoint(targetPos)
-    if on and sp.Z > 0 then
-        local ap = getAimPoint()
-        local dx, dy = sp.X - ap.X, sp.Y - ap.Y
-        if math.abs(dx) > 0.5 or math.abs(dy) > 0.5 then
-            if instant then
-                sendMouseDelta(dx, dy, sp.X, sp.Y)
-            else
-                local sens = math.max(0.05, St.smooth) * 6
-                sendMouseDelta(dx / sens, dy / sens, ap.X + dx / sens, ap.Y + dy / sens)
-            end
-        end
-    end
-    return true
-end
-
-function fireClick()
-    pcall(function()
-        local char = getChar(LocalPlayer)
-        if char then
-            local tool = char:FindFirstChildOfClass("Tool")
-            if tool then
-                tool:Activate()
-            end
-        end
-        if VirtualInputManager then
-            local mp = screenMouse()
-            VirtualInputManager:SendMouseButtonEvent(mp.X, mp.Y, 0, true, game, 0)
-            VirtualInputManager:SendMouseButtonEvent(mp.X, mp.Y, 0, false, game, 0)
-        end
-        if mouse1press and mouse1release then
-            mouse1press()
-            mouse1release()
-        elseif mouse1click then
-            mouse1click()
-        else
-            pcall(function() VirtualUser:CaptureController() end)
-            VirtualUser:ClickButton1(Vector2.new(0, 0))
-        end
-    end)
-end
-
-function prepareWallbangTarget()
+function refreshWallbangLock()
     if not St.wallbang then
-        WallbangTargetPart = nil
+        WallbangLockedPlayer = nil
         return
     end
-    local target = bestTarget()
-    WallbangTargetPart = target and getHitPart(getChar(target)) or nil
-end
-
-function exitWallbangVoid()
-    local root = getRoot(getChar(LocalPlayer))
-    if root and WallbangSavedRootCF then
-        root.CFrame = WallbangSavedRootCF
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-    end
-    WallbangSavedRootCF = nil
-    WallbangInVoid = false
-    if WallbangVoidNoclip then
-        WallbangVoidNoclip = false
-        if not St.noclip then setNoclip(false) end
-    end
-    local cam = workspace.CurrentCamera
-    local hum = getHum(getChar(LocalPlayer))
-    if cam and WallbangSavedCamCF then
-        cam.CFrame = WallbangSavedCamCF
-        cam.CameraType = Enum.CameraType.Custom
-        if hum then cam.CameraSubject = hum end
-    end
-    WallbangSavedCamCF = nil
-end
-
-function enterWallbangVoid(targetPart)
-    if not targetPart or not targetPart.Parent then return end
-    local root = getRoot(getChar(LocalPlayer))
-    if not root then return end
-
-    local char = targetPart:FindFirstAncestorOfClass("Model")
-    local tRoot = char and getRoot(char) or targetPart
-    local depth = math.max(St.wallbangDepth or 5, 2)
-    local voidPos = tRoot.Position - Vector3.new(0, depth, 0)
-
-    if not WallbangSavedRootCF then
-        WallbangSavedRootCF = root.CFrame
-        local cam = workspace.CurrentCamera
-        if cam then
-            WallbangSavedCamCF = cam.CFrame
+    if wallbangActive() then
+        if not (WallbangLockedPlayer and isEnemy(WallbangLockedPlayer)) then
+            WallbangLockedPlayer = bestTarget()
         end
-        if not St.noclip then
-            setNoclip(true)
-            WallbangVoidNoclip = true
+    else
+        WallbangLockedPlayer = nil
+    end
+    if WallbangLockedPlayer and not isEnemy(WallbangLockedPlayer) then
+        WallbangLockedPlayer = nil
+    end
+end
+
+function syncWallbangTargetPart()
+    if WallbangLockedPlayer and isEnemy(WallbangLockedPlayer) then
+        WallbangTargetPart = getHitPart(getChar(WallbangLockedPlayer))
+    else
+        WallbangTargetPart = nil
+    end
+end
+
+function getWallbangLockName()
+    if WallbangLockedPlayer and isEnemy(WallbangLockedPlayer) then
+        return WallbangLockedPlayer.DisplayName
+    end
+    return nil
+end
+
+
+function shouldWallbangIgnoreMap()
+    return wallbangHooksActive()
+end
+
+function wallbangMapInstances()
+    local t = {}
+    local seen = {}
+    for _, n in ipairs(MAP_FOLDERS) do
+        local f = workspace:FindFirstChild(n)
+        if f and not seen[f] then
+            seen[f] = true
+            t[#t + 1] = f
         end
-        WallbangInVoid = true
     end
-
-    root.CFrame = CFrame.new(voidPos, targetPart.Position)
-    root.AssemblyLinearVelocity = Vector3.zero
-    root.AssemblyAngularVelocity = Vector3.zero
+    return t
 end
 
-function updateWallbangCamera()
-    if not wallbangVoidActive() or not WallbangTargetPart or not WallbangTargetPart.Parent then return end
-    local cam = workspace.CurrentCamera
-    if not cam then return end
-    local camPos = WallbangSavedCamCF and WallbangSavedCamCF.Position or cam.CFrame.Position
-    cam.CameraType = Enum.CameraType.Scriptable
-    cam.CFrame = CFrame.new(camPos, WallbangTargetPart.Position)
-end
-
-function wallbangCombatStep()
-    if not wallbangShootActive() or not WallbangTargetPart or not WallbangTargetPart.Parent then return end
-    aimAtTarget(WallbangTargetPart, true)
-    if isFiring() then
-        pcall(function()
-            local char = getChar(LocalPlayer)
-            local tool = char and char:FindFirstChildOfClass("Tool")
-            if tool then tool:Activate() end
-        end)
-    end
-end
-
-local function installWallbangHooks()
-    if WallbangHookInstalled or not hookmetamethod then return end
-    pcall(function()
-        WallbangPlayerMouse = LocalPlayer:GetMouse()
-    end)
-    connect(LocalPlayer.CharacterAdded, function()
-        task.defer(function()
-            pcall(function() WallbangPlayerMouse = LocalPlayer:GetMouse() end)
-        end)
-    end)
-    local wrap = newcclosure or function(f) return f end
-    OldWallbangIndex = hookmetamethod(game, "__index", wrap(function(self, key)
-        if wallbangVoidActive() and isFiring() and WallbangTargetPart and WallbangPlayerMouse and self == WallbangPlayerMouse then
-            if key == "Hit" then
-                return CFrame.new(WallbangTargetPart.Position)
-            elseif key == "Target" then
-                return WallbangTargetPart
-            elseif key == "UnitRay" then
-                local cam = workspace.CurrentCamera
-                if cam then
-                    local o = cam.CFrame.Position
-                    local d = WallbangTargetPart.Position - o
-                    if d.Magnitude > 0.05 then
-                        return Ray.new(o, d.Unit)
-                    end
-                end
+function mergeRayIgnoreList(list)
+    local merged = {}
+    local seen = {}
+    if type(list) == "table" then
+        for _, v in ipairs(list) do
+            if v and not seen[v] then
+                seen[v] = true
+                merged[#merged + 1] = v
             end
         end
-        return OldWallbangIndex(self, key)
+    end
+    for _, v in ipairs(wallbangMapInstances()) do
+        if not seen[v] then
+            seen[v] = true
+            merged[#merged + 1] = v
+        end
+    end
+    return merged
+end
+
+function mergeRaycastParams(params)
+    local map = wallbangMapInstances()
+    if #map == 0 then return params end
+    local list = {}
+    if params then
+        for _, v in ipairs(params.FilterDescendantsInstances or {}) do
+            list[#list + 1] = v
+        end
+    end
+    for _, v in ipairs(map) do
+        list[#list + 1] = v
+    end
+    local p = RaycastParams.new()
+    if params then
+        p.FilterType = params.FilterType or Enum.RaycastFilterType.Exclude
+        p.IgnoreWater = params.IgnoreWater
+        p.CollisionGroup = params.CollisionGroup
+    else
+        p.FilterType = Enum.RaycastFilterType.Exclude
+        p.IgnoreWater = true
+    end
+    p.FilterDescendantsInstances = list
+    return p
+end
+
+function wallbangTargetCharacter()
+    if not WallbangTargetPart then return nil end
+    return WallbangTargetPart:FindFirstAncestorOfClass("Model")
+end
+
+function isWallbangTargetHit(part)
+    if not part or not WallbangTargetPart then return false end
+    local char = wallbangTargetCharacter()
+    return char and part:IsDescendantOf(char)
+end
+
+function getWallbangShotOrigin()
+    local char = getChar(LocalPlayer)
+    local root = getRoot(char)
+    if not root then return Vector3.zero end
+    if char then
+        local tool = char:FindFirstChildOfClass("Tool")
+        if tool then
+            local handle = tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart")
+            if handle then return handle.Position end
+        end
+    end
+    return root.Position + Vector3.new(0, 1.2, 0)
+end
+
+function getWallbangShotDirection()
+    if not WallbangTargetPart then return nil end
+    local origin = getWallbangShotOrigin()
+    local delta = WallbangTargetPart.Position - origin
+    if delta.Magnitude < 0.05 then return nil end
+    return delta.Unit
+end
+
+function getWallbangUnitRay()
+    local dir = getWallbangShotDirection() or Vector3.new(0, 0, -1)
+    return Ray.new(getWallbangShotOrigin(), dir)
+end
+
+function getWallbangMouseHitCFrame()
+    local hitPos = WallbangTargetPart and WallbangTargetPart.Position or getWallbangShotOrigin()
+    local dir = getWallbangShotDirection()
+    return CFrame.new(hitPos, hitPos + dir)
+end
+
+function fakeRaycastResult(origin, part)
+    local o = isLocalWallbangOrigin(origin) and getWallbangShotOrigin() or origin
+    local delta = part.Position - o
+    local dir = getWallbangShotDirection() or (delta.Magnitude > 0.05 and delta.Unit or Vector3.new(0, 1, 0))
+    return {
+        Instance = part,
+        Position = part.Position,
+        Normal = -dir,
+        Material = Enum.Material.Plastic,
+        Distance = (part.Position - o).Magnitude,
+    }
+end
+
+function redirectFindPartResult(part, pos)
+    if not wallbangHooksActive() or not WallbangTargetPart then
+        return part, pos
+    end
+    if isWallbangTargetHit(part) then
+        return part, pos
+    end
+    return WallbangTargetPart, WallbangTargetPart.Position
+end
+
+function isLocalWallbangOrigin(origin)
+    if typeof(origin) ~= "Vector3" then return false end
+    local root = getRoot(getChar(LocalPlayer))
+    if not root then return false end
+    return (origin - root.Position).Magnitude < 14
+end
+
+function wallbangPenetrationActive()
+    if not St.wallbang or not St.running then return false end
+    if not wallbangActive() then return false end
+    syncWallbangTargetPart()
+    if not WallbangTargetPart or not WallbangTargetPart.Parent then return false end
+    if isFiring() then
+        WallbangHookUntil = tick() + 0.08
+        return true
+    end
+    return tick() <= WallbangHookUntil
+end
+
+function wallbangHooksActive()
+    return wallbangPenetrationActive()
+end
+
+local function removeWallbangHooks()
+    if not WallbangHookInstalled then return end
+    if OldWallbangNamecall then
+        if unhookmetamethod then
+            pcall(function() unhookmetamethod(game, "__namecall", OldWallbangNamecall) end)
+        elseif restorefunction and isfunctionhooked and isfunctionhooked(OldWallbangNamecall) then
+            pcall(restorefunction, OldWallbangNamecall)
+        end
+    end
+    OldWallbangNamecall = nil
+    WallbangHookInstalled = false
+end
+
+function ensureWallbangHooks()
+    if not St.wallbang or WallbangHookInstalled or not hookmetamethod then return end
+    local wrap = newcclosure or function(f) return f end
+
+    OldWallbangNamecall = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+        if WallbangCheckCaller() or not wallbangHooksActive() then
+            return OldWallbangNamecall(self, ...)
+        end
+        local method = WallbangGetNamecallMethod()
+        if method == "Raycast" then
+            local origin, direction, params = ...
+            if isLocalWallbangOrigin(origin) and WallbangTargetPart then
+                local merged = mergeRaycastParams(params)
+                local mag = typeof(direction) == "Vector3" and direction.Magnitude or 512
+                if mag < 1 then mag = 512 end
+                local aimDir = getWallbangShotDirection()
+                if aimDir then
+                    local result = OldWallbangNamecall(self, origin, aimDir * mag, merged)
+                    if not result or not isWallbangTargetHit(result.Instance) then
+                        return fakeRaycastResult(origin, WallbangTargetPart)
+                    end
+                    return result
+                end
+            end
+        elseif method == "FindPartOnRayWithIgnoreList" then
+            local args = { ... }
+            local ray = args[1]
+            if ray and isLocalWallbangOrigin(ray.Origin) and WallbangTargetPart then
+                args[1] = getWallbangUnitRay()
+                args[2] = mergeRayIgnoreList(args[2])
+                local packed = { OldWallbangNamecall(self, table.unpack(args)) }
+                packed[1], packed[2] = redirectFindPartResult(packed[1], packed[2])
+                return table.unpack(packed)
+            end
+        elseif method == "FindPartOnRay" then
+            local ray = ...
+            if ray and isLocalWallbangOrigin(ray.Origin) and WallbangTargetPart then
+                local packed = { OldWallbangNamecall(self, getWallbangUnitRay(), select(2, ...)) }
+                packed[1], packed[2] = redirectFindPartResult(packed[1], packed[2])
+                return table.unpack(packed)
+            end
+        end
+        return OldWallbangNamecall(self, ...)
     end))
     WallbangHookInstalled = true
 end
 
-function updateWallbangVoid()
-    if not St.running or not St.wallbang then
-        exitWallbangVoid()
-        WallbangTargetPart = nil
-        return
+function syncWallbangHookState()
+    local armed = St.wallbang and wallbangActive()
+        and WallbangLockedPlayer and isEnemy(WallbangLockedPlayer)
+    if armed then
+        ensureWallbangHooks()
+    else
+        removeWallbangHooks()
     end
-
-    if rageActive() and St.desyncOrbit then
-        exitWallbangVoid()
-        return
-    end
-
-    if not wallbangShootActive() then
-        exitWallbangVoid()
-        WallbangTargetPart = nil
-        return
-    end
-
-    prepareWallbangTarget()
-    if not WallbangTargetPart then
-        exitWallbangVoid()
-        return
-    end
-
-    enterWallbangVoid(WallbangTargetPart)
 end
 
 function clearWallbangShot()
-    WallbangTargetPart = nil
-    exitWallbangVoid()
-end
-
-function disableBarriers()
-    if not St.barrierDisable then return end
-    for _, folderName in ipairs(BARRIER_FOLDERS) do
-        local folder = workspace:FindFirstChild(folderName)
-        if folder then
-            for _, d in ipairs(folder:GetDescendants()) do
-                if d:IsA("BasePart") and not DisabledBarriers[d] then
-                    local n = string.lower(d.Name)
-                    for _, kw in ipairs(BARRIER_KEYWORDS) do
-                        if string.find(n, kw, 1, true) then
-                            DisabledBarriers[d] = { CanTouch = d.CanTouch, CanCollide = d.CanCollide }
-                            d.CanTouch = false
-                            if string.find(n, "barrier", 1, true) or string.find(n, "kill", 1, true) then
-                                d.CanCollide = false
-                            end
-                            break
-                        end
-                    end
-                end
-            end
-        end
-    end
-end
-
-function restoreBarriers()
-    for part, state in pairs(DisabledBarriers) do
-        if part and part.Parent then
-            part.CanTouch = state.CanTouch
-            if state.CanCollide ~= nil then
-                part.CanCollide = state.CanCollide
-            end
-        end
-    end
-    table.clear(DisabledBarriers)
-end
-
-function rescanBarriers()
-    restoreBarriers()
-    if St.barrierDisable then
-        disableBarriers()
-    end
+    St.wallbangToggled = false
+    St.wallbangHold = false
+    clearWallbangLock()
 end
 
 function ensureEspFolder()
@@ -1559,13 +1439,8 @@ function serializeSettings()
         showFov = St.showFov, fov = St.fov, smooth = St.smooth,
         visibleCheck = St.visibleCheck, hitPart = St.hitPart,
         teamCheck = St.teamCheck, targetPriority = St.targetPriority,
-        ragebot = St.ragebot, rageKey = keyCodeToName(St.rageKey), rageMode = St.rageMode,
-        wallbang = St.wallbang, autoFire = St.autoFire,
-        desyncOrbit = St.desyncOrbit, orbitRadius = St.orbitRadius, orbitSpeed = St.orbitSpeed,
-        barrierDisable = St.barrierDisable,
-        rageSpin = St.rageSpin, rageSpinSpeed = St.rageSpinSpeed,
-        rageSpeedBoost = St.rageSpeedBoost, rageSpeedMult = St.rageSpeedMult,
-        triggerbot = St.triggerbot,
+        wallbang = St.wallbang, wallbangKey = keyCodeToName(St.wallbangKey),
+        wallbangMode = St.wallbangMode, triggerbot = St.triggerbot,
         triggerDelay = St.triggerDelay, triggerRandom = St.triggerRandom,
         triggerMaxDist = St.triggerMaxDist, triggerRadius = St.triggerRadius,
         espEnabled = St.espEnabled, espBoxes = St.espBoxes, espTracers = St.espTracers,
@@ -1630,25 +1505,14 @@ function applySettings(data, opts)
     applyBoolField(data, "aimOnShoot")
     applyBoolField(data, "showFov")
     applyBoolField(data, "wallbang", Ref.wallbangToggle)
+    if type(data.wallbangKey) == "string" then St.wallbangKey = applyKeyFromName(data.wallbangKey, St.wallbangKey) end
+    applyNumField(data, "wallbangMode", 1, 3)
     applyNumField(data, "fov", 20, 400)
     applyNumField(data, "smooth", 0.05, 1)
     applyBoolField(data, "visibleCheck")
     applyNumField(data, "hitPart", 1, #HIT_PARTS)
     applyBoolField(data, "teamCheck")
     applyNumField(data, "targetPriority", 1, 2)
-    applyBoolField(data, "ragebot", Ref.ragebotToggle)
-    if type(data.rageKey) == "string" then St.rageKey = applyKeyFromName(data.rageKey, St.rageKey) end
-    applyNumField(data, "rageMode", 1, 3)
-    applyBoolField(data, "wallbang")
-    applyBoolField(data, "autoFire")
-    applyBoolField(data, "desyncOrbit")
-    applyNumField(data, "orbitRadius", 4, 40)
-    applyNumField(data, "orbitSpeed", 1, 20)
-    applyBoolField(data, "barrierDisable")
-    applyBoolField(data, "rageSpin", Ref.rageSpinToggle)
-    applyNumField(data, "rageSpinSpeed", 2, 40)
-    applyBoolField(data, "rageSpeedBoost", Ref.rageSpeedToggle)
-    applyNumField(data, "rageSpeedMult", 1, 5)
     applyBoolField(data, "triggerbot", Ref.triggerToggle)
     applyNumField(data, "triggerDelay", 0, 1)
     applyNumField(data, "triggerRandom", 0, 0.5)
@@ -1834,7 +1698,6 @@ end
 
 function triggerbotStep()
     if not St.running or not St.triggerbot then return end
-    if rageActive() then return end
     if not getChar(LocalPlayer) then return end
     local target = crosshairTarget()
     if not target then return end
@@ -1901,19 +1764,6 @@ function updateMovement(dt)
         root.AssemblyAngularVelocity = Vector3.zero
     elseif hum.PlatformStand then
         hum.PlatformStand = false
-    end
-end
-
-function updateRageExtras(dt)
-    if not rageActive() then return end
-    local root = getRoot(getChar(LocalPlayer))
-    local hum = getHum(getChar(LocalPlayer))
-    if not root or not hum then return end
-    if St.rageSpin then
-        root.CFrame = root.CFrame * CFrame.Angles(0, math.rad(St.rageSpinSpeed * dt * 60), 0)
-    end
-    if St.rageSpeedBoost then
-        hum.WalkSpeed = DefaultWalkSpeed * St.rageSpeedMult
     end
 end
 
@@ -2139,64 +1989,6 @@ function updateThirdPerson()
     cam.CFrame = CFrame.new(root.Position + Vector3.new(0, 2, 0) + back, root.Position + Vector3.new(0, 1.5, 0))
 end
 
-function lockOrbitTarget()
-    if OrbitTarget and isEnemy(OrbitTarget) then
-        return OrbitTarget
-    end
-    OrbitTarget = bestTarget()
-    OrbitAngle = 0
-    return OrbitTarget
-end
-
-function getRageTarget()
-    if not rageActive() then return nil end
-    if OrbitTarget and isEnemy(OrbitTarget) then
-        return OrbitTarget
-    end
-    local prev = OrbitTarget
-    local next = lockOrbitTarget()
-    if next and next ~= prev then
-        notify("Locked: " .. next.DisplayName, Color3.fromRGB(255, 160, 80))
-    end
-    return next
-end
-
-function clearOrbitTarget()
-    OrbitTarget = nil
-    OrbitAngle = 0
-    LastCombatCF = nil
-    disableRageOrbitView()
-end
-
-function enableRageOrbitView()
-    local hum = getHum(getChar(LocalPlayer))
-    local cam = workspace.CurrentCamera
-    if hum then
-        if SavedOrbitZoomMin == nil then
-            SavedOrbitZoomMin = hum.CameraMinZoomDistance
-            SavedOrbitZoomMax = hum.CameraMaxZoomDistance
-        end
-        local dist = math.max(St.thirdPersonDist, 10)
-        hum.CameraMinZoomDistance = dist
-        hum.CameraMaxZoomDistance = dist
-    end
-    if cam then
-        cam.CameraType = Enum.CameraType.Custom
-        if hum then cam.CameraSubject = hum end
-    end
-end
-
-function disableRageOrbitView()
-    local hum = getHum(getChar(LocalPlayer))
-    if hum and SavedOrbitZoomMin ~= nil then
-        hum.CameraMinZoomDistance = SavedOrbitZoomMin
-        hum.CameraMaxZoomDistance = SavedOrbitZoomMax
-        SavedOrbitZoomMin = nil
-        SavedOrbitZoomMax = nil
-    end
-    restoreCamera()
-end
-
 function restoreCamera()
     local cam = workspace.CurrentCamera
     if not cam then return end
@@ -2214,56 +2006,13 @@ function restoreCamera()
     end
 end
 
-function updateOrbit(dt)
-    if not rageActive() then
-        disableRageOrbitView()
-        return
-    end
-
-    if not St.desyncOrbit then
-        disableRageOrbitView()
-        return
-    end
-
-    enableRageOrbitView()
-
-    local myRoot = getRoot(getChar(LocalPlayer))
-    if not myRoot then return end
-
-    local target = getRageTarget()
-    if not target then return end
-
-    local tRoot = getRoot(getChar(target))
-    if not tRoot then return end
-
-    OrbitAngle = OrbitAngle + St.orbitSpeed * dt
-    local off = Vector3.new(math.cos(OrbitAngle), 0.8, math.sin(OrbitAngle)) * St.orbitRadius
-    local orbitPos = tRoot.Position + off
-    LastCombatCF = CFrame.new(orbitPos, tRoot.Position)
-    myRoot.CFrame = LastCombatCF
-    myRoot.AssemblyLinearVelocity = Vector3.zero
-    myRoot.AssemblyAngularVelocity = Vector3.zero
-
-    local hum = getHum(getChar(LocalPlayer))
-    if hum then
-        hum:ChangeState(Enum.HumanoidStateType.Running)
-    end
-end
-
 function aimStatusText()
-    if rageActive() then return "RAGE", Color3.fromRGB(255, 120, 80) end
     if not St.aimbot then return "OFF", Color3.fromRGB(255, 90, 90) end
     if St.aimMode == 1 then return "ON", Color3.fromRGB(80, 255, 120) end
     if St.aimToggled or St.aimHold then return "ON", Color3.fromRGB(80, 255, 120) end
     return "OFF", Color3.fromRGB(255, 90, 90)
 end
 
-function rageStatusText()
-    if not St.ragebot then return "OFF", Color3.fromRGB(255, 90, 90) end
-    if St.rageMode == 1 then return "ON", Color3.fromRGB(255, 100, 100) end
-    if St.rageToggled or St.rageHold then return "ON", Color3.fromRGB(255, 100, 100) end
-    return "OFF", Color3.fromRGB(255, 90, 90)
-end
 
 function updateStatusLabels()
     if Ref.aimKeyLbl then
@@ -2291,38 +2040,25 @@ function updateStatusLabels()
         Ref.visCheckLbl.TextColor3 = St.visibleCheck and Color3.fromRGB(80, 255, 120) or Color3.fromRGB(160, 160, 160)
     end
     if Ref.wallbangLbl then
-        local voidTxt = wallbangVoidActive() and "VOID" or (St.wallbang and "ON" or "OFF")
-        Ref.wallbangLbl.Text = "Wallbang: " .. voidTxt
-        Ref.wallbangLbl.TextColor3 = wallbangVoidActive() and Color3.fromRGB(255, 160, 80)
-            or (St.wallbang and Color3.fromRGB(80, 255, 120) or Color3.fromRGB(160, 160, 160))
+        local lockName = getWallbangLockName()
+        local statusTxt = (lockName and ("LOCK: " .. lockName))
+            or (St.wallbang and "ARMED" or "OFF")
+        Ref.wallbangLbl.Text = "Wallbang: " .. statusTxt
+        Ref.wallbangLbl.TextColor3 = lockName and Color3.fromRGB(120, 200, 255)
+            or (St.wallbang and Color3.fromRGB(200, 200, 120) or Color3.fromRGB(160, 160, 160))
+    end
+    if Ref.wallbangKeyLbl then
+        Ref.wallbangKeyLbl.Text = "Wallbang Key: [" .. keyLabel(St.wallbangKey) .. "]"
+    end
+    if Ref.wallbangStatus then
+        local t, c = wallbangStatusText()
+        Ref.wallbangStatus.Text = t
+        Ref.wallbangStatus.TextColor3 = c
+    end
+    if Ref.wallbangModeLbl then
+        Ref.wallbangModeLbl.Text = "Wallbang Mode: " .. (AIM_MODES[St.wallbangMode] or "?")
     end
 
-    if Ref.rageKeyLbl then
-        Ref.rageKeyLbl.Text = "Rage Key: [" .. keyLabel(St.rageKey) .. "]"
-    end
-    if Ref.rageStatus then
-        local t, c = rageStatusText()
-        Ref.rageStatus.Text = t
-        Ref.rageStatus.TextColor3 = c
-    end
-    if Ref.rageModeLbl then
-        Ref.rageModeLbl.Text = "Rage Mode: " .. (AIM_MODES[St.rageMode] or "?")
-    end
-
-    if Ref.rageBanner then
-        local parts = {}
-        if rageActive() then parts[#parts + 1] = "RAGEBOT ACTIVE" end
-        if rageActive() and OrbitTarget and isEnemy(OrbitTarget) then
-            parts[#parts + 1] = "LOCK: " .. OrbitTarget.DisplayName
-        end
-        if St.wallbang and rageActive() then parts[#parts + 1] = "WALLBANG" end
-        if St.autoFire and rageActive() then parts[#parts + 1] = "AUTO FIRE" end
-        if St.desyncOrbit and rageActive() then parts[#parts + 1] = "ORBIT VIEW" end
-        if St.barrierDisable then parts[#parts + 1] = "BARRIERS OFF" end
-        Ref.rageBanner.Text = #parts > 0
-            and table.concat(parts, "  |  ")
-            or "No rage features active — enable toggles below, press [" .. keyLabel(St.rageKey) .. "] to toggle ragebot"
-    end
 
     if Ref.espStatus then
         local mode = HasDrawing and "Drawing + Tags" or "Tags/Chams only"
@@ -2341,40 +2077,20 @@ end
 function combatStep()
     if not St.running then return end
 
-    if wallbangVoidActive() and WallbangTargetPart then
-        wallbangCombatStep()
-        return
-    end
+    refreshWallbangLock()
 
-    if rageActive() then
-        local target = getRageTarget()
-        if target then
-            local part = getHitPart(getChar(target))
-            if part then
-                aimAtTarget(part, true)
-                local now = tick()
-                if now - LastFire >= 1 / 20 then
-                    LastFire = now
-                    fireClick()
-                end
-            end
+    if aimActive() then
+        local target = bestTarget()
+        if canAim() and target then
+            aimAtTarget(getHitPart(getChar(target)), false)
         end
-        return
-    end
-
-    if not aimActive() then return end
-    local target = bestTarget()
-    if canAim() and target then
-        aimAtTarget(getHitPart(getChar(target)), false)
     end
 end
 
 function unload()
     St.running = false
+    removeWallbangHooks()
     clearWallbangShot()
-    clearOrbitTarget()
-    disableRageOrbitView()
-    restoreBarriers()
     clearAllEsp()
     resetAllVisuals()
     restoreMovement()
@@ -2401,13 +2117,7 @@ local PROFILE_BOOL_FIELDS = {
     "showFov",
     "visibleCheck",
     "teamCheck",
-    "ragebot",
     "wallbang",
-    "autoFire",
-    "desyncOrbit",
-    "barrierDisable",
-    "rageSpin",
-    "rageSpeedBoost",
     "triggerbot",
     "espEnabled",
     "espBoxes",
@@ -2442,11 +2152,7 @@ local PROFILE_NUM_FIELDS = {
     { name = "smooth", min = 0.05, max = 1 },
     { name = "hitPart", min = 1, max = 4 },
     { name = "targetPriority", min = 1, max = 2 },
-    { name = "rageMode", min = 1, max = 3 },
-    { name = "orbitRadius", min = 4, max = 40 },
-    { name = "orbitSpeed", min = 1, max = 20 },
-    { name = "rageSpinSpeed", min = 2, max = 40 },
-    { name = "rageSpeedMult", min = 1, max = 5 },
+    { name = "wallbangMode", min = 1, max = 3 },
     { name = "triggerDelay", min = 0, max = 1 },
     { name = "triggerRandom", min = 0, max = 0.5 },
     { name = "triggerMaxDist", min = 50, max = 2000 },
@@ -2688,10 +2394,7 @@ function countCombatFeaturesEnabled()
     local n = 0
     if St.aimbot then n += 1 end
     if St.triggerbot then n += 1 end
-    if St.ragebot then n += 1 end
-    if St.autoFire then n += 1 end
     if St.wallbang then n += 1 end
-    if St.desyncOrbit then n += 1 end
     return n
 end
 
@@ -2718,13 +2421,8 @@ local ST_DOCS = {
     aimbot = { type = "boolean", desc = "Enable mouse aimbot", default = "false" },
     aimMode = { type = "number", desc = "1=Always 2=Toggle 3=Hold", default = "2" },
     triggerbot = { type = "boolean", desc = "Auto fire when crosshair on enemy in FOV", default = "false" },
-    ragebot = { type = "boolean", desc = "Enable rage combat mode", default = "false" },
-    wallbang = { type = "boolean", desc = "TP 5 studs below FOV target while shooting with clear aim", default = "false" },
-    autoFire = { type = "boolean", desc = "VirtualUser click while raging and shooting", default = "false" },
-    desyncOrbit = { type = "boolean", desc = "Orbit around rage target HRP", default = "false" },
-    barrierDisable = { type = "boolean", desc = "Disable kill barriers in map folders", default = "false" },
-    rageSpin = { type = "boolean", desc = "Rotate local HRP while rage active", default = "false" },
-    rageSpeedBoost = { type = "boolean", desc = "Multiply walkspeed while rage active", default = "false" },
+    ragebot = { type = "boolean", desc = "Removed", default = "false" },
+    wallbang = { type = "boolean", desc = "Silent raycast redirect through walls while firing", default = "false" },
     espEnabled = { type = "boolean", desc = "Master ESP drawing toggle", default = "false" },
     espSkeleton = { type = "boolean", desc = "Draw R6/R15 bone lines", default = "false" },
     espHeadCircle = { type = "boolean", desc = "Circle at head viewport pos", default = "false" },
@@ -2926,7 +2624,6 @@ function snapshotCombatState()
         aimbot = St.aimbot,
         triggerbot = St.triggerbot,
         ragebot = St.ragebot,
-        autoFire = St.autoFire,
         wallbang = St.wallbang,
         desyncOrbit = St.desyncOrbit,
         rageSpin = St.rageSpin,
@@ -6399,7 +6096,6 @@ function makeTab(name, row)
 end
 
 local legitStack = makeTab("Legit", TabRow1)
-local rageStack = makeTab("Rage", TabRow1)
 local espStack = makeTab("ESP", TabRow1)
 local worldStack = makeTab("World", TabRow1)
 local moveStack = makeTab("Move", TabRow2)
@@ -6411,7 +6107,7 @@ local miscStack = makeTab("Misc", TabRow2)
 local legitGuide = makeGroupbox(legitStack, "Quick Start")
 label(legitGuide, "1) Enable Aimbot + set your hold key below", 13, nil, 7)
 label(legitGuide, "2) Set Aim Mode to Hold — hold your key to lock on", 13, nil, 7)
-label(legitGuide, "3) Wallbang: hold LMB — you go 5 studs under them and shoot", 13, nil, 7)
+label(legitGuide, "3) Wallbang (Q): lock target, LMB redirects shots through walls", 13, nil, 7)
 label(legitGuide, "4) Triggerbot: toggle ON = auto shoots visible enemies in crosshair", 13, nil, 7)
 
 local legitKeys = makeGroupbox(legitStack, "Aimbot Keybinds")
@@ -6428,7 +6124,6 @@ Ref.aimStatus.Size = UDim2.fromOffset(40, 14)
 Ref.aimModeLbl = label(legitKeys, "Activation: Hold", 13, nil, 7)
 Ref.aimBindHelp = label(legitKeys, "Hold [E] to lock onto targets", 13, nil, 7)
 Ref.visCheckLbl = label(legitKeys, "Visible Check: OFF", 13, nil, 7)
-Ref.wallbangLbl = label(legitKeys, "Wallbang: OFF", 13, nil, 7)
 
 makeCycle(legitKeys, "Aim Mode", AIM_MODES, function() return St.aimMode end, function(v)
     St.aimMode = v
@@ -6465,18 +6160,6 @@ makeToggle(legitSettings, "Visible Check", function(v)
     St.visibleCheck = v
 end, St.visibleCheck)
 
-Ref.wallbangToggle = makeToggle(legitSettings, "Wallbang (5 studs under target)", function(v)
-    St.wallbang = v
-    if not v then clearWallbangShot() end
-end, St.wallbang)
-label(legitSettings, "Hold LMB near enemy — TP 5 studs below them, aim + shoot up", 12, nil, 7)
-makeSlider(legitSettings, "Depth Below Target (studs)", {
-    min = 2, max = 30,
-    get = function() return St.wallbangDepth end,
-    set = function(v) St.wallbangDepth = v end,
-    fmt = function(v) return math.floor(v) .. " studs" end,
-})
-
 makeToggle(legitSettings, "Show FOV Circle", function(v)
     St.showFov = v
     if not v and FovCircle then FovCircle.Visible = false end
@@ -6511,6 +6194,42 @@ makeCycle(legitSettings, "Hit Part", HIT_PARTS, function() return St.hitPart end
     St.hitPart = v
 end)
 
+local wallbangBox = makeGroupbox(legitStack, "Wallbang")
+label(wallbangBox, "Silent raycast redirect — no teleport, hooks only while firing", 12, nil, 7)
+label(wallbangBox, "Toggle wallbang ON, press Q to lock, shoot through cover", 12, nil, 7)
+
+local wallbangKeyRow = Instance.new("Frame")
+wallbangKeyRow.BackgroundTransparency = 1
+wallbangKeyRow.Size = UDim2.new(1, 0, 0, 16)
+wallbangKeyRow.ZIndex = 6
+wallbangKeyRow.Parent = wallbangBox
+Ref.wallbangKeyLbl = label(wallbangKeyRow, "Wallbang Key: [" .. keyLabel(St.wallbangKey) .. "]", 13, UDim2.fromOffset(0, 0), 7)
+Ref.wallbangStatus = label(wallbangKeyRow, "OFF", 13, UDim2.new(1, -44, 0, 0), 7, Enum.TextXAlignment.Right)
+Ref.wallbangStatus.Size = UDim2.fromOffset(40, 14)
+Ref.wallbangLbl = label(wallbangBox, "Wallbang: OFF", 13, nil, 7)
+Ref.wallbangModeLbl = label(wallbangBox, "Wallbang Mode: Toggle", 13, nil, 7)
+
+Ref.wallbangToggle = makeToggle(wallbangBox, "Enable Wallbang", function(v)
+    St.wallbang = v
+    if not v then clearWallbangShot() end
+    syncWallbangHookState()
+end, St.wallbang)
+
+makeCycle(wallbangBox, "Wallbang Mode", AIM_MODES, function() return St.wallbangMode end, function(v)
+    St.wallbangMode = v
+    if v ~= 2 then St.wallbangToggled = false end
+    if v ~= 3 then St.wallbangHold = false end
+    if not wallbangActive() then clearWallbangShot() end
+    updateStatusLabels()
+end)
+
+makeButton(wallbangBox, "Set Wallbang Keybind", function()
+    St.rebinding = "wallbang"
+    if Ref.wallbangKeyLbl then
+        Ref.wallbangKeyLbl.Text = "Wallbang Key: [ press a key... ]"
+    end
+end)
+
 local triggerBox = makeGroupbox(legitStack, "Triggerbot")
 label(triggerBox, "Toggle ON — auto fires when a visible enemy is in your crosshair", 12, nil, 7)
 label(triggerBox, "No key bind needed. Uses raycast + visible check.", 12, nil, 7)
@@ -6540,125 +6259,6 @@ makeSlider(triggerBox, "Max Distance", {
     fmt = function(v) return math.floor(v) .. " studs" end,
 })
 
--- ── Rage tab ──
-Ref.rageBanner = label(rageStack, "No rage features active", 13, UDim2.fromOffset(0, 0), 6)
-Ref.rageBanner.TextWrapped = true
-Ref.rageBanner.Size = UDim2.new(1, -4, 0, 32)
-
-local rageGuide = makeGroupbox(rageStack, "Quick Start")
-label(rageGuide, "1) Enable Ragebot — auto-locks target, aims, fires, orbits", 13, nil, 7)
-label(rageGuide, "2) Press X to toggle/hold rage off (Toggle/Hold modes)", 13, nil, 7)
-label(rageGuide, "Stays on same target until they die, then picks next", 13, nil, 7)
-
-local rageKeys = makeGroupbox(rageStack, "Rage Keybinds")
-
-local rageKeyRow = Instance.new("Frame")
-rageKeyRow.BackgroundTransparency = 1
-rageKeyRow.Size = UDim2.new(1, 0, 0, 16)
-rageKeyRow.ZIndex = 6
-rageKeyRow.Parent = rageKeys
-Ref.rageKeyLbl = label(rageKeyRow, "Rage Key: [" .. keyLabel(St.rageKey) .. "]", 13, UDim2.fromOffset(0, 0), 7)
-Ref.rageStatus = label(rageKeyRow, "OFF", 13, UDim2.new(1, -44, 0, 0), 7, Enum.TextXAlignment.Right)
-Ref.rageStatus.Size = UDim2.fromOffset(40, 14)
-
-Ref.rageModeLbl = label(rageKeys, "Rage Mode: Toggle", 13, nil, 7)
-
-makeCycle(rageKeys, "Rage Mode", AIM_MODES, function() return St.rageMode end, function(v)
-    St.rageMode = v
-    if v ~= 2 then St.rageToggled = false end
-    if v ~= 3 then St.rageHold = false end
-end)
-
-makeButton(rageKeys, "Set Rage Keybind", function()
-    St.rebinding = "rage"
-    if Ref.rageKeyLbl then
-        Ref.rageKeyLbl.Text = "Rage Key: [ press a key... ]"
-    end
-end)
-
-local rageFeatures = makeGroupbox(rageStack, "Rage Features")
-
-Ref.ragebotToggle = makeToggle(rageFeatures, "Enable Ragebot", function(v)
-    St.ragebot = v
-    if v then
-        St.wallbang = true
-        St.autoFire = true
-        St.desyncOrbit = true
-        if St.rageMode == 2 then
-            St.rageToggled = true
-        elseif St.rageMode == 3 then
-            St.rageHold = false
-        end
-        local t = lockOrbitTarget()
-        if t then
-            notify("Rage ON — locked " .. t.DisplayName, Color3.fromRGB(255, 120, 80))
-        else
-            notify("Rage ON — waiting for target", Color3.fromRGB(255, 120, 80))
-        end
-    else
-        St.rageToggled = false
-        St.rageHold = false
-        clearOrbitTarget()
-        disableRageOrbitView()
-    end
-end, St.ragebot)
-
-makeToggle(rageFeatures, "Auto Fire", function(v)
-    St.autoFire = v
-end, St.autoFire)
-
-makeToggle(rageFeatures, "Wallbang (also in Legit tab)", function(v)
-    St.wallbang = v
-    if not v then clearWallbangShot() end
-end, St.wallbang)
-
-makeToggle(rageFeatures, "Orbit Camera (see yourself circle target)", function(v)
-    St.desyncOrbit = v
-    if not v then
-        clearOrbitTarget()
-        disableRageOrbitView()
-    end
-end, St.desyncOrbit)
-
-makeToggle(rageFeatures, "Death Barrier Disabler", function(v)
-    St.barrierDisable = v
-    if v then
-        disableBarriers()
-    else
-        restoreBarriers()
-    end
-end, St.barrierDisable)
-
-makeSlider(rageFeatures, "Orbit Radius", {
-    min = 4,
-    max = 40,
-    get = function() return St.orbitRadius end,
-    set = function(v) St.orbitRadius = v end,
-    fmt = function(v) return math.floor(v) .. " studs" end,
-})
-
-makeSlider(rageFeatures, "Orbit Speed", {
-    min = 1,
-    max = 20,
-    get = function() return St.orbitSpeed end,
-    set = function(v) St.orbitSpeed = v end,
-    fmt = function(v) return math.floor(v) end,
-})
-
-Ref.rageSpinToggle = makeToggle(rageFeatures, "Spin Bot (while rage active)", function(v) St.rageSpin = v end, St.rageSpin)
-makeSlider(rageFeatures, "Spin Speed", {
-    min = 2, max = 40,
-    get = function() return St.rageSpinSpeed end,
-    set = function(v) St.rageSpinSpeed = v end,
-    fmt = function(v) return math.floor(v) end,
-})
-Ref.rageSpeedToggle = makeToggle(rageFeatures, "Speed Boost (while rage active)", function(v) St.rageSpeedBoost = v end, St.rageSpeedBoost)
-makeSlider(rageFeatures, "Speed Multiplier", {
-    min = 1, max = 5,
-    get = function() return St.rageSpeedMult end,
-    set = function(v) St.rageSpeedMult = v end,
-    fmt = function(v) return string.format("%.1fx", v) end,
-})
 
 -- ── ESP tab ──
 local camBox = makeGroupbox(espStack, "Camera & Chams")
@@ -6894,7 +6494,6 @@ end
 
 -- ── Misc tab ──
 local miscBox = makeGroupbox(miscStack, "Misc")
-makeButton(miscBox, "Rescan Barriers", rescanBarriers)
 makeButton(miscBox, "Unload Script", unload)
 Ref.drawingStatus = label(miscBox, "", 13, nil, 7)
 Ref.fpsLbl = label(miscBox, "FPS: --", 13, nil, 7)
@@ -6906,7 +6505,7 @@ Ref.hideWmToggle = makeToggle(miscBox, "Hide Watermark", function(v)
 end, St.hideWatermark)
 Ref.featureCheckLbl = label(miscBox, "Feature checklist loads at runtime", 12, nil, 7)
 label(miscBox, "RightShift / Insert — hide menu", 13, nil, 7)
-label(miscBox, "Legit: E aim | Rage: X rage | Profiles in Config", 13, nil, 7)
+label(miscBox, "Legit: E aim | Q wallbang | Profiles in Config", 13, nil, 7)
 
 -- Watermark
 WmOuter, WmInner = bordered(ScreenGui, MAIN, Accent, UDim2.fromOffset(118, 22), UDim2.new(1, -128, 1, -32), 20)
@@ -6982,10 +6581,11 @@ connect(UserInputService.InputBegan, function(input, gp)
         end
         return
     end
-    if St.rebinding == "rage" and input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode ~= Enum.KeyCode.Unknown then
-        St.rageKey = input.KeyCode
+    if St.rebinding == "wallbang" and input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode ~= Enum.KeyCode.Unknown then
+        St.wallbangKey = input.KeyCode
         St.rebinding = nil
         updateStatusLabels()
+        notify("Wallbang key: " .. keyLabel(St.wallbangKey), Accent)
         return
     end
 
@@ -7006,29 +6606,9 @@ connect(UserInputService.InputBegan, function(input, gp)
     if gp then return end
     if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
 
-    if input.KeyCode == St.rageKey and St.ragebot then
-        if St.rageMode == 2 then
-            St.rageToggled = not St.rageToggled
-            if St.rageToggled then
-                local t = lockOrbitTarget()
-                if t then
-                    notify("Locked: " .. t.DisplayName, Color3.fromRGB(255, 120, 80))
-                end
-            else
-                clearOrbitTarget()
-                disableRageOrbitView()
-            end
-        elseif St.rageMode == 3 then
-            St.rageHold = true
-            local t = lockOrbitTarget()
-            if t then
-                notify("Locked: " .. t.DisplayName, Color3.fromRGB(255, 120, 80))
-            end
-        end
-        updateStatusLabels()
-        if rageActive() then
-            notify("Rage ON — orbiting locked target", Color3.fromRGB(255, 120, 80))
-        end
+    if input.KeyCode == St.wallbangKey and St.wallbang and St.wallbangMode == 2 then
+        handleWallbangBindBegan()
+        return
     end
 end)
 
@@ -7037,17 +6617,7 @@ connect(UserInputService.InputEnded, function(input, gp)
         handleAimBindEnded()
         return
     end
-    if input.UserInputType == Enum.UserInputType.MouseButton1 and St.wallbang then
-        exitWallbangVoid()
-        WallbangTargetPart = nil
-    end
     if gp then return end
-    if input.KeyCode == St.rageKey and St.rageMode == 3 then
-        St.rageHold = false
-        clearOrbitTarget()
-        disableRageOrbitView()
-        updateStatusLabels()
-    end
 end)
 
 -- ═══════════════════════════════════════════════════════════════
@@ -7092,22 +6662,18 @@ connect(RunService.Heartbeat, function(dt)
     if not St.running then return end
 
     refreshAimHoldState()
-    updateWallbangVoid()
-    updateOrbit(dt)
+    refreshWallbangHoldState()
+    refreshWallbangLock()
+    syncWallbangHookState()
     updateMovement(dt)
-    updateRageExtras(dt)
     triggerbotStep()
 
-    if St.barrierDisable then
-        disableBarriers()
-    end
 end)
 
 connect(RunService.RenderStepped, function(dt)
     if not St.running then return end
 
     combatStep()
-    updateWallbangCamera()
     applyVisualEffects()
 
     if St.showFov then
@@ -7127,9 +6693,7 @@ connect(RunService.RenderStepped, function(dt)
     camTick = camTick + dt
     if camTick >= 1 / 30 then
         camTick = 0
-        if wallbangVoidActive() then
-            updateWallbangCamera()
-        elseif St.thirdPerson and not (rageActive() and St.desyncOrbit) then
+        if St.thirdPerson then
             updateThirdPerson()
         else
             local cam = workspace.CurrentCamera
@@ -7173,8 +6737,8 @@ task.defer(function()
 end)
 
 
-print("[Cobalt Redux] Loaded - Legit/Rage/ESP/World/Move/Players/Config/Misc tabs ready.")
-installWallbangHooks()
+print("[Cobalt Redux] Loaded - Legit/ESP/World/Move/Players/Config/Misc tabs ready.")
+syncWallbangHookState()
 task.defer(function()
-    notify("Menu loaded — RightShift to hide | E = aim | X = rage", Accent)
+    notify("Menu loaded — RightShift to hide | E = aim | Q = wallbang", Accent)
 end)
