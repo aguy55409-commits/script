@@ -219,7 +219,9 @@ local SpinAngle = 0
 local LastTrigger = 0
 local WallbangTargetPart = nil
 local WallbangSavedRootCF = nil
+local WallbangSavedCamCF = nil
 local WallbangVoidNoclip = false
+local WallbangInVoid = false
 local NoclipParts = {}
 local Stats = { fps = 0, fpsTick = 0, start = tick() }
 local saveProfile, loadProfile, deleteProfile, refreshProfileList
@@ -834,44 +836,56 @@ function exitWallbangVoid()
         root.AssemblyAngularVelocity = Vector3.zero
     end
     WallbangSavedRootCF = nil
+    WallbangInVoid = false
     if WallbangVoidNoclip then
         WallbangVoidNoclip = false
         if not St.noclip then setNoclip(false) end
     end
+    local cam = workspace.CurrentCamera
+    local hum = getHum(getChar(LocalPlayer))
+    if cam and WallbangSavedCamCF then
+        cam.CFrame = WallbangSavedCamCF
+        cam.CameraType = Enum.CameraType.Custom
+        if hum then cam.CameraSubject = hum end
+    end
+    WallbangSavedCamCF = nil
 end
 
 function enterWallbangVoid(targetPart)
+    if not targetPart or not targetPart.Parent then return end
     local root = getRoot(getChar(LocalPlayer))
     if not root then return end
 
     if not WallbangSavedRootCF then
         WallbangSavedRootCF = root.CFrame
+        local cam = workspace.CurrentCamera
+        if cam then
+            WallbangSavedCamCF = cam.CFrame
+            cam.CameraType = Enum.CameraType.Scriptable
+        end
         if not St.noclip then
             setNoclip(true)
             WallbangVoidNoclip = true
         end
+        WallbangInVoid = true
     end
 
     local depth = math.max(St.wallbangDepth or 120, 40)
-    local voidPos
-    local lookAt
+    local voidPos = Vector3.new(targetPart.Position.X, targetPart.Position.Y - depth, targetPart.Position.Z)
 
-    if targetPart and targetPart.Parent then
-        voidPos = Vector3.new(targetPart.Position.X, targetPart.Position.Y - depth, targetPart.Position.Z)
-        lookAt = targetPart.Position
-    else
-        voidPos = WallbangSavedRootCF.Position - Vector3.new(0, depth, 0)
-        lookAt = WallbangSavedRootCF.Position + WallbangSavedRootCF.LookVector * 20
+    root.CFrame = CFrame.new(voidPos, targetPart.Position)
+    if not WallbangInVoid then
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
     end
+end
 
-    root.CFrame = CFrame.new(voidPos, lookAt)
-    root.AssemblyLinearVelocity = Vector3.zero
-    root.AssemblyAngularVelocity = Vector3.zero
-
-    local hum = getHum(getChar(LocalPlayer))
-    if hum then
-        hum:ChangeState(Enum.HumanoidStateType.Physics)
-    end
+function updateWallbangCamera()
+    if not wallbangVoidActive() or not WallbangSavedCamCF then return end
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    cam.CameraType = Enum.CameraType.Scriptable
+    cam.CFrame = WallbangSavedCamCF
 end
 
 function updateWallbangVoid()
@@ -893,6 +907,11 @@ function updateWallbangVoid()
     end
 
     prepareWallbangTarget()
+    if not WallbangTargetPart then
+        exitWallbangVoid()
+        return
+    end
+
     enterWallbangVoid(WallbangTargetPart)
 end
 
@@ -6397,7 +6416,7 @@ Ref.wallbangToggle = makeToggle(legitSettings, "Wallbang (void under map)", func
     St.wallbang = v
     if not v then clearWallbangShot() end
 end, St.wallbang)
-label(legitSettings, "Hold shoot — TP beneath target/map, restore when you release LMB", 12, nil, 7)
+label(legitSettings, "Aim at enemy, hold LMB — body voids, camera stays locked so you can shoot", 12, nil, 7)
 makeSlider(legitSettings, "Void Depth (studs below target)", {
     min = 40, max = 300,
     get = function() return St.wallbangDepth end,
@@ -7035,6 +7054,7 @@ connect(RunService.RenderStepped, function(dt)
     if not St.running then return end
 
     combatStep()
+    updateWallbangCamera()
     applyVisualEffects()
 
     if St.showFov then
@@ -7054,7 +7074,9 @@ connect(RunService.RenderStepped, function(dt)
     camTick = camTick + dt
     if camTick >= 1 / 30 then
         camTick = 0
-        if St.thirdPerson and not (rageActive() and St.desyncOrbit) then
+        if wallbangVoidActive() then
+            updateWallbangCamera()
+        elseif St.thirdPerson and not (rageActive() and St.desyncOrbit) then
             updateThirdPerson()
         else
             local cam = workspace.CurrentCamera
