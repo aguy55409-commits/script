@@ -218,9 +218,11 @@ local DefaultGravity = workspace.Gravity
 local SpinAngle = 0
 local LastTrigger = 0
 local SilentAimPart = nil
+local SilentAimPlayer = nil
 local PlayerMouse = nil
 local SilentHooksInstalled = false
 local OldSilentIndex, OldSilentNamecall
+local SilentAimTick = 0
 local NoclipParts = {}
 local Stats = { fps = 0, fpsTick = 0, start = tick() }
 local saveProfile, loadProfile, deleteProfile, refreshProfileList
@@ -577,8 +579,8 @@ end
 
 function canAim()
     if rageActive() then return true end
+    if St.silentAim then return false end
     if not aimActive() then return false end
-    if St.silentAim then return isFiring() end
     if St.aimOnShoot and not isShooting() then return false end
     return true
 end
@@ -809,7 +811,7 @@ function fireClick()
 end
 
 local function silentAimActive()
-    return St.running and St.silentAim and not rageActive() and SilentAimPart ~= nil
+    return St.running and St.silentAim and not rageActive() and isFiring() and SilentAimPart ~= nil
 end
 
 local function isHookCaller()
@@ -845,56 +847,48 @@ end
 function refreshSilentTarget()
     if not St.running or not St.silentAim or rageActive() then
         SilentAimPart = nil
+        SilentAimPlayer = nil
         return
     end
     if not isFiring() then
         SilentAimPart = nil
+        SilentAimPlayer = nil
         return
     end
+    local now = tick()
+    if SilentAimPart and SilentAimPart.Parent and now - SilentAimTick < 0.05 then
+        return
+    end
+    SilentAimTick = now
     local target = bestTarget()
-    SilentAimPart = target and getHitPart(getChar(target)) or nil
+    if target then
+        SilentAimPlayer = target
+        SilentAimPart = getHitPart(getChar(target))
+    else
+        SilentAimPlayer = nil
+        SilentAimPart = nil
+    end
 end
 
-local function redirectAimVector3(vec)
-    local cam = workspace.CurrentCamera
-    if not cam or not SilentAimPart or typeof(vec) ~= "Vector3" then
-        return vec
-    end
-    local camPos = cam.CFrame.Position
-    local offset = vec - camPos
-    if offset.Magnitude < 2 then
-        return vec
-    end
-    if offset:Dot(cam.CFrame.LookVector) < 0.05 then
-        return vec
-    end
-    return SilentAimPart.Position
-end
-
-local function rewriteSilentArgs(args)
+local function rewriteFireServerArgs(args)
+    if not SilentAimPart then return false end
     local changed = false
     for i, arg in ipairs(args) do
         local t = typeof(arg)
-        if t == "Vector3" then
-            local next = redirectAimVector3(arg)
-            if next ~= arg then
-                args[i] = next
+        if t == "Ray" then
+            local origin = arg.Origin
+            local dist = arg.Direction.Magnitude
+            if dist <= 0 then dist = 512 end
+            local dir = SilentAimPart.Position - origin
+            if dir.Magnitude > 0.05 then
+                args[i] = Ray.new(origin, dir.Unit * dist)
                 changed = true
             end
-        elseif t == "CFrame" then
-            args[i] = getSilentHitCFrame() or arg
-            changed = true
-        elseif t == "Ray" and SilentAimPart then
-            local cam = workspace.CurrentCamera
-            if cam then
-                local origin = arg.Origin
-                local dist = arg.Direction.Magnitude
-                if dist <= 0 then dist = 1000 end
-                local dir = SilentAimPart.Position - origin
-                if dir.Magnitude > 0.05 then
-                    args[i] = Ray.new(origin, dir.Unit * dist)
-                    changed = true
-                end
+        elseif t == "Instance" and arg:IsA("BasePart") and SilentAimPlayer then
+            local tchar = getChar(SilentAimPlayer)
+            if tchar and arg:IsDescendantOf(tchar) then
+                args[i] = SilentAimPart
+                changed = true
             end
         end
     end
@@ -915,22 +909,15 @@ function installSilentHooks()
     end)
 
     OldSilentIndex = hookmetamethod(game, "__index", wrapClosure(function(self, key)
-        if silentAimActive() and not isHookCaller() then
-            if PlayerMouse and self == PlayerMouse then
-                if key == "Hit" then
-                    local hit = getSilentHitCFrame()
-                    if hit then return hit end
-                elseif key == "Target" then
-                    return SilentAimPart
-                elseif key == "UnitRay" then
-                    local ray = getSilentUnitRay()
-                    if ray then return ray end
-                end
-            end
-            local cam = workspace.CurrentCamera
-            if cam and self == cam and key == "CFrame" and isFiring() then
-                local real = OldSilentIndex(self, key)
-                return CFrame.new(real.Position, SilentAimPart.Position)
+        if silentAimActive() and not isHookCaller() and PlayerMouse and self == PlayerMouse then
+            if key == "Hit" then
+                local hit = getSilentHitCFrame()
+                if hit then return hit end
+            elseif key == "Target" then
+                return SilentAimPart
+            elseif key == "UnitRay" then
+                local ray = getSilentUnitRay()
+                if ray then return ray end
             end
         end
         return OldSilentIndex(self, key)
@@ -939,39 +926,10 @@ function installSilentHooks()
     OldSilentNamecall = hookmetamethod(game, "__namecall", wrapClosure(function(self, ...)
         if silentAimActive() and not isHookCaller() then
             local method = getnamecallmethod()
-            local args = { ... }
-
             if method == "FireServer" or method == "InvokeServer" then
-                if rewriteSilentArgs(args) then
+                local args = { ... }
+                if rewriteFireServerArgs(args) then
                     return OldSilentNamecall(self, table.unpack(args))
-                end
-            elseif method == "Raycast" and self == workspace and isFiring() then
-                local origin, direction = args[1], args[2]
-                if typeof(origin) == "Vector3" and typeof(direction) == "Vector3" then
-                    local cam = workspace.CurrentCamera
-                    if cam and (origin - cam.CFrame.Position).Magnitude < 12 then
-                        local dist = direction.Magnitude
-                        if dist <= 0 then dist = 2048 end
-                        local dir = SilentAimPart.Position - origin
-                        if dir.Magnitude > 0.05 then
-                            args[2] = dir.Unit * dist
-                            return OldSilentNamecall(self, table.unpack(args))
-                        end
-                    end
-                end
-            elseif (method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList") and isFiring() then
-                local ray = args[1]
-                if typeof(ray) == "Ray" then
-                    local cam = workspace.CurrentCamera
-                    if cam and (ray.Origin - cam.CFrame.Position).Magnitude < 12 then
-                        local dist = ray.Direction.Magnitude
-                        if dist <= 0 then dist = 2048 end
-                        local dir = SilentAimPart.Position - ray.Origin
-                        if dir.Magnitude > 0.05 then
-                            args[1] = Ray.new(ray.Origin, dir.Unit * dist)
-                            return OldSilentNamecall(self, table.unpack(args))
-                        end
-                    end
                 end
             end
         end
@@ -2304,7 +2262,7 @@ function updateStatusLabels()
         Ref.visCheckLbl.TextColor3 = St.visibleCheck and Color3.fromRGB(80, 255, 120) or Color3.fromRGB(160, 160, 160)
     end
     if Ref.silentLbl then
-        Ref.silentLbl.Text = "Silent Aim: " .. (St.silentAim and "ON (server spoof, LMB)" or "OFF")
+        Ref.silentLbl.Text = "Silent Aim: " .. (St.silentAim and "ON (invisible spoof)" or "OFF")
         Ref.silentLbl.TextColor3 = St.silentAim and Color3.fromRGB(80, 255, 120) or Color3.fromRGB(160, 160, 160)
     end
 
@@ -2376,6 +2334,7 @@ function combatStep()
 end
 
 function silentAimStep()
+    if not St.silentAim then return end
     refreshSilentTarget()
 end
 
@@ -2383,6 +2342,7 @@ function unload()
     St.running = false
     St.silentAim = false
     SilentAimPart = nil
+    SilentAimPlayer = nil
     clearOrbitTarget()
     disableRageOrbitView()
     restoreBarriers()
@@ -2731,7 +2691,7 @@ end
 local ST_DOCS = {
     aimbot = { type = "boolean", desc = "Enable mouse aimbot", default = "false" },
     aimMode = { type = "number", desc = "1=Always 2=Toggle 3=Hold", default = "2" },
-    silentAim = { type = "boolean", desc = "Spoofs Mouse.Hit and aim remotes to target on LMB without moving crosshair", default = "false" },
+    silentAim = { type = "boolean", desc = "Spoofs Mouse.Hit to server on LMB only — zero camera or crosshair movement", default = "false" },
     triggerbot = { type = "boolean", desc = "Auto fire when crosshair on enemy in FOV", default = "false" },
     ragebot = { type = "boolean", desc = "Enable rage combat mode", default = "false" },
     wallbang = { type = "boolean", desc = "Ignore map in visibility raycasts when raging", default = "false" },
@@ -6480,13 +6440,14 @@ makeToggle(legitSettings, "Visible Check", function(v)
     St.visibleCheck = v
 end, St.visibleCheck)
 
-Ref.silentToggle = makeToggle(legitSettings, "Silent Aim (server spoof on LMB)", function(v)
+Ref.silentToggle = makeToggle(legitSettings, "Silent Aim (invisible, server only)", function(v)
     St.silentAim = v
     if not v then
         SilentAimPart = nil
+        SilentAimPlayer = nil
     end
 end, St.silentAim)
-label(legitSettings, "Crosshair stays put — game reads aim at target instead", 12, nil, 7)
+label(legitSettings, "No camera movement — only spoofs Mouse.Hit to server on LMB", 12, nil, 7)
 
 makeToggle(legitSettings, "Show FOV Circle", function(v)
     St.showFov = v
@@ -7100,9 +7061,6 @@ local uiTick = 0
 connect(RunService.Heartbeat, function(dt)
     if not St.running then return end
 
-    if St.silentAim then
-        refreshSilentTarget()
-    end
     refreshAimHoldState()
     updateOrbit(dt)
     updateMovement(dt)
