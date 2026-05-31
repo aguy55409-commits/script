@@ -65,7 +65,8 @@ local WALLBANG_IGNORE_TAGS = {
 }
 local BARRIER_KEYWORDS = { "kill", "death", "void", "lava", "barrier", "deadzone", "oob", "hurt", "damage" }
 local BARRIER_FOLDERS = { "Map", "KillParts", "Barriers", "Terrain" }
-local HIDE_KEYS = { Enum.KeyCode.RightShift, Enum.KeyCode.Insert }
+local MENU_TOGGLE_KEY = Enum.KeyCode.RightShift
+local LastMenuToggle = 0
 local SNAP_DIST = 15
 
 local CONFIG_DIR = "CobaltRedux/config"
@@ -163,6 +164,7 @@ local St = {
     priorityUserId = nil,
     hideWatermark = false,
     showFps = false,
+    showBindOverlay = true,
     themeName = "Cobalt",
     autoSaveProfiles = false,
 }
@@ -186,6 +188,8 @@ local FovCircle = nil
 
 local ToastGui = nil
 local WmOuter = nil
+local BindOverlayOuter = nil
+local RebindIgnoreUntil = 0
 local ProfileNameBox = nil
 local ConfigStatusLbl = nil
 local ProfileListFrame = nil
@@ -467,6 +471,64 @@ function isMouseBindInput(input)
     return input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.MouseButton2
         or input.UserInputType == Enum.UserInputType.MouseButton3
+end
+
+function cancelRebind()
+    St.rebinding = nil
+    RebindIgnoreUntil = 0
+    updateStatusLabels()
+end
+
+function startRebind(mode)
+    St.rebinding = mode
+    RebindIgnoreUntil = tick() + 0.35
+    updateStatusLabels()
+    if mode == "aim" then
+        notify("Press a key or mouse button for aim bind", Accent)
+    elseif mode == "wallbang" then
+        notify("Press a keyboard key for wallbang (Esc to cancel)", Accent)
+    end
+end
+
+function processRebindInput(input)
+    if not St.rebinding then return false end
+    if tick() < RebindIgnoreUntil then return true end
+
+    if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == Enum.KeyCode.Escape then
+        cancelRebind()
+        notify("Rebind cancelled", Color3.fromRGB(180, 180, 180))
+        return true
+    end
+
+    if St.rebinding == "aim" then
+        if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode ~= Enum.KeyCode.Unknown then
+            St.aimBindType = "key"
+            St.aimKey = input.KeyCode
+            cancelRebind()
+            notify("Aim bind: " .. keyLabel(St.aimKey), Accent)
+            return true
+        end
+        if isMouseBindInput(input) then
+            St.aimBindType = "mouse"
+            St.aimMouse = input.UserInputType
+            cancelRebind()
+            notify("Aim bind: " .. mouseBindLabel(St.aimMouse), Accent)
+            return true
+        end
+        return true
+    end
+
+    if St.rebinding == "wallbang" then
+        if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode ~= Enum.KeyCode.Unknown then
+            St.wallbangKey = input.KeyCode
+            cancelRebind()
+            notify("Wallbang bind: " .. keyLabel(St.wallbangKey), Accent)
+            return true
+        end
+        return true
+    end
+
+    return false
 end
 
 function handleAimBindBegan()
@@ -2008,15 +2070,81 @@ end
 
 function aimStatusText()
     if not St.aimbot then return "OFF", Color3.fromRGB(255, 90, 90) end
-    if St.aimMode == 1 then return "ON", Color3.fromRGB(80, 255, 120) end
+    if St.aimMode == 1 then return "ALWAYS", Color3.fromRGB(80, 255, 120) end
     if St.aimToggled or St.aimHold then return "ON", Color3.fromRGB(80, 255, 120) end
     return "OFF", Color3.fromRGB(255, 90, 90)
+end
+
+function createBindOverlayRow(parent, featureName, rowId)
+    local row = Instance.new("Frame")
+    row.BackgroundTransparency = 1
+    row.Size = UDim2.new(1, 0, 0, 18)
+    row.ZIndex = 6
+    row.Parent = parent
+
+    Ref["bind_" .. rowId .. "_name"] = label(row, featureName, 13, UDim2.fromOffset(0, 1), 7)
+    Ref["bind_" .. rowId .. "_name"].Size = UDim2.fromOffset(72, 14)
+
+    Ref["bind_" .. rowId .. "_key"] = label(row, "[?]", 13, UDim2.fromOffset(74, 1), 7)
+    Ref["bind_" .. rowId .. "_key"].Size = UDim2.fromOffset(44, 14)
+    Ref["bind_" .. rowId .. "_key"].TextColor3 = Color3.fromRGB(170, 210, 255)
+
+    Ref["bind_" .. rowId .. "_status"] = label(row, "OFF", 13, UDim2.new(1, -52, 0, 1), 7, Enum.TextXAlignment.Right)
+    Ref["bind_" .. rowId .. "_status"].Size = UDim2.fromOffset(48, 14)
+end
+
+function updateBindOverlay()
+    if not BindOverlayOuter then return end
+    BindOverlayOuter.Visible = St.showBindOverlay
+
+    if Ref.bind_aim_key then
+        if St.rebinding == "aim" then
+            Ref.bind_aim_key.Text = "[...]"
+            Ref.bind_aim_status.Text = "SET KEY"
+            Ref.bind_aim_status.TextColor3 = Color3.fromRGB(255, 220, 80)
+        else
+            Ref.bind_aim_key.Text = St.aimMode == 1 and "—" or ("[" .. aimBindLabel() .. "]")
+            local t, c = aimStatusText()
+            if not St.aimbot then
+                t, c = "DISABLED", Color3.fromRGB(120, 120, 120)
+            end
+            Ref.bind_aim_status.Text = t
+            Ref.bind_aim_status.TextColor3 = c
+        end
+    end
+
+    if Ref.bind_wallbang_key then
+        if St.rebinding == "wallbang" then
+            Ref.bind_wallbang_key.Text = "[...]"
+            Ref.bind_wallbang_status.Text = "SET KEY"
+            Ref.bind_wallbang_status.TextColor3 = Color3.fromRGB(255, 220, 80)
+        elseif not St.wallbang then
+            Ref.bind_wallbang_key.Text = "—"
+            Ref.bind_wallbang_status.Text = "DISABLED"
+            Ref.bind_wallbang_status.TextColor3 = Color3.fromRGB(120, 120, 120)
+        else
+            Ref.bind_wallbang_key.Text = St.wallbangMode == 1 and "—" or ("[" .. keyLabel(St.wallbangKey) .. "]")
+            local t, c = wallbangStatusText()
+            Ref.bind_wallbang_status.Text = t
+            Ref.bind_wallbang_status.TextColor3 = c
+        end
+    end
+
+    if Ref.bind_menu_status then
+        Ref.bind_menu_key.Text = "[RShift]"
+        Ref.bind_menu_status.Text = St.uiHidden and "HIDDEN" or "OPEN"
+        Ref.bind_menu_status.TextColor3 = St.uiHidden and Color3.fromRGB(255, 180, 80) or Color3.fromRGB(80, 255, 120)
+    end
 end
 
 
 function updateStatusLabels()
     if Ref.aimKeyLbl then
-        Ref.aimKeyLbl.Text = "Aim Hold Key: [" .. aimBindLabel() .. "]"
+        if St.rebinding == "aim" then
+            Ref.aimKeyLbl.Text = "Aim Hold Key: [ press key or mouse... ]"
+        else
+            Ref.aimKeyLbl.Text = "Aim Hold Key: [" .. aimBindLabel() .. "]"
+        end
     end
     if Ref.aimStatus then
         local t, c = aimStatusText()
@@ -2027,7 +2155,9 @@ function updateStatusLabels()
         Ref.aimModeLbl.Text = "Activation: " .. (AIM_MODES[St.aimMode] or "?")
     end
     if Ref.aimBindHelp then
-        if St.aimMode == 1 then
+        if St.rebinding == "aim" then
+            Ref.aimBindHelp.Text = "Listening... (Esc to cancel)"
+        elseif St.aimMode == 1 then
             Ref.aimBindHelp.Text = "Aim locks whenever Aimbot is enabled (no key)"
         elseif St.aimMode == 2 then
             Ref.aimBindHelp.Text = "Press [" .. aimBindLabel() .. "] to toggle aim on/off"
@@ -2048,7 +2178,11 @@ function updateStatusLabels()
             or (St.wallbang and Color3.fromRGB(200, 200, 120) or Color3.fromRGB(160, 160, 160))
     end
     if Ref.wallbangKeyLbl then
-        Ref.wallbangKeyLbl.Text = "Wallbang Key: [" .. keyLabel(St.wallbangKey) .. "]"
+        if St.rebinding == "wallbang" then
+            Ref.wallbangKeyLbl.Text = "Wallbang Key: [ press key... ]"
+        else
+            Ref.wallbangKeyLbl.Text = "Wallbang Key: [" .. keyLabel(St.wallbangKey) .. "]"
+        end
     end
     if Ref.wallbangStatus then
         local t, c = wallbangStatusText()
@@ -2072,6 +2206,7 @@ function updateStatusLabels()
     if Ref.featureCheckLbl and getFeatureChecklistText then
         Ref.featureCheckLbl.Text = getFeatureChecklistText()
     end
+    updateBindOverlay()
 end
 
 function combatStep()
@@ -5918,6 +6053,19 @@ function setUIVisible(show)
     if WindowOuter then WindowOuter.Visible = show end
     if ScreenGui then ScreenGui.Enabled = true end
     if OverlayGui then OverlayGui.Enabled = true end
+    updateBindOverlay()
+end
+
+function toggleMenu()
+    local now = tick()
+    if now - LastMenuToggle < 0.2 then return end
+    LastMenuToggle = now
+    setUIVisible(St.uiHidden)
+end
+
+function isMenuToggleInput(input)
+    return input.UserInputType == Enum.UserInputType.Keyboard
+        and input.KeyCode == MENU_TOGGLE_KEY
 end
 
 -- ═══════════════════════════════════════════════════════════════
@@ -5973,6 +6121,45 @@ FovStroke.Color = Accent
 FovStroke.Thickness = 2
 FovStroke.Transparency = 0.35
 FovStroke.Parent = FovRing
+
+BindOverlayOuter = Instance.new("Frame")
+BindOverlayOuter.Name = "BindOverlay"
+BindOverlayOuter.AnchorPoint = Vector2.new(1, 0.5)
+BindOverlayOuter.Position = UDim2.new(1, -10, 0.5, 0)
+BindOverlayOuter.Size = UDim2.fromOffset(176, 0)
+BindOverlayOuter.AutomaticSize = Enum.AutomaticSize.Y
+BindOverlayOuter.BackgroundColor3 = BLACK
+BindOverlayOuter.BorderSizePixel = 0
+BindOverlayOuter.Visible = St.showBindOverlay
+BindOverlayOuter.Active = false
+BindOverlayOuter.ZIndex = 5
+BindOverlayOuter.Parent = OverlayGui
+
+local _, BindOverlayInner = bordered(BindOverlayOuter, MAIN, Accent, UDim2.new(1, 0, 0, 0), UDim2.fromOffset(1, 1), 5)
+BindOverlayInner.Size = UDim2.new(1, -2, 0, 0)
+BindOverlayInner.AutomaticSize = Enum.AutomaticSize.Y
+
+label(BindOverlayInner, "Keybinds", 13, UDim2.fromOffset(6, 4), 6)
+
+local bindStack = Instance.new("Frame")
+bindStack.BackgroundTransparency = 1
+bindStack.Position = UDim2.fromOffset(6, 22)
+bindStack.Size = UDim2.new(1, -12, 0, 0)
+bindStack.AutomaticSize = Enum.AutomaticSize.Y
+bindStack.ZIndex = 6
+bindStack.Parent = BindOverlayInner
+
+local bindLayout = Instance.new("UIListLayout")
+bindLayout.Padding = UDim.new(0, 4)
+bindLayout.Parent = bindStack
+
+local bindPad = Instance.new("UIPadding")
+bindPad.PaddingBottom = UDim.new(0, 6)
+bindPad.Parent = bindStack
+
+createBindOverlayRow(bindStack, "Aimbot", "aim")
+createBindOverlayRow(bindStack, "Wallbang", "wallbang")
+createBindOverlayRow(bindStack, "Menu", "menu")
 
 WindowOuter = Instance.new("Frame")
 WindowOuter.Name = "Window"
@@ -6133,13 +6320,7 @@ makeCycle(legitKeys, "Aim Mode", AIM_MODES, function() return St.aimMode end, fu
 end)
 
 makeButton(legitKeys, "Set Aim Hold Key (keyboard / LMB / RMB / MMB)", function()
-    St.rebinding = "aim"
-    if Ref.aimKeyLbl then
-        Ref.aimKeyLbl.Text = "Aim Hold Key: [ press key or mouse button... ]"
-    end
-    if Ref.aimBindHelp then
-        Ref.aimBindHelp.Text = "Listening for new bind..."
-    end
+    startRebind("aim")
 end)
 
 local legitSettings = makeGroupbox(legitStack, "Aimbot Settings")
@@ -6224,10 +6405,7 @@ makeCycle(wallbangBox, "Wallbang Mode", AIM_MODES, function() return St.wallbang
 end)
 
 makeButton(wallbangBox, "Set Wallbang Keybind", function()
-    St.rebinding = "wallbang"
-    if Ref.wallbangKeyLbl then
-        Ref.wallbangKeyLbl.Text = "Wallbang Key: [ press a key... ]"
-    end
+    startRebind("wallbang")
 end)
 
 local triggerBox = makeGroupbox(legitStack, "Triggerbot")
@@ -6499,12 +6677,16 @@ Ref.drawingStatus = label(miscBox, "", 13, nil, 7)
 Ref.fpsLbl = label(miscBox, "FPS: --", 13, nil, 7)
 Ref.execLbl = label(miscBox, "Executor: " .. getExecutorName(), 13, nil, 7)
 Ref.showFpsToggle = makeToggle(miscBox, "Show FPS Counter", function(v) St.showFps = v end, St.showFps)
+Ref.showBindOverlayToggle = makeToggle(miscBox, "Show Keybind Overlay", function(v)
+    St.showBindOverlay = v
+    updateBindOverlay()
+end, St.showBindOverlay)
 Ref.hideWmToggle = makeToggle(miscBox, "Hide Watermark", function(v)
     St.hideWatermark = v
     if WmOuter then WmOuter.Visible = not v end
 end, St.hideWatermark)
 Ref.featureCheckLbl = label(miscBox, "Feature checklist loads at runtime", 12, nil, 7)
-label(miscBox, "RightShift / Insert — hide menu", 13, nil, 7)
+label(miscBox, "RightShift — toggle menu", 13, nil, 7)
 label(miscBox, "Legit: E aim | Q wallbang | Profiles in Config", 13, nil, 7)
 
 -- Watermark
@@ -6565,38 +6747,12 @@ end)
 -- ═══════════════════════════════════════════════════════════════
 
 connect(UserInputService.InputBegan, function(input, gp)
-    if St.rebinding == "aim" then
-        if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode ~= Enum.KeyCode.Unknown then
-            St.aimBindType = "key"
-            St.aimKey = input.KeyCode
-            St.rebinding = nil
-            updateStatusLabels()
-            notify("Aim hold key: " .. keyLabel(St.aimKey), Accent)
-        elseif isMouseBindInput(input) then
-            St.aimBindType = "mouse"
-            St.aimMouse = input.UserInputType
-            St.rebinding = nil
-            updateStatusLabels()
-            notify("Aim hold key: " .. mouseBindLabel(St.aimMouse), Accent)
-        end
-        return
-    end
-    if St.rebinding == "wallbang" and input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode ~= Enum.KeyCode.Unknown then
-        St.wallbangKey = input.KeyCode
-        St.rebinding = nil
-        updateStatusLabels()
-        notify("Wallbang key: " .. keyLabel(St.wallbangKey), Accent)
+    if isMenuToggleInput(input) and not St.rebinding then
+        toggleMenu()
         return
     end
 
-    if input.UserInputType == Enum.UserInputType.Keyboard then
-        for _, key in ipairs(HIDE_KEYS) do
-            if input.KeyCode == key then
-                setUIVisible(St.uiHidden)
-                return
-            end
-        end
-    end
+    if processRebindInput(input) then return end
 
     if inputMatchesAimBind(input) then
         handleAimBindBegan()
@@ -6615,9 +6771,7 @@ end)
 connect(UserInputService.InputEnded, function(input, gp)
     if inputMatchesAimBind(input) then
         handleAimBindEnded()
-        return
     end
-    if gp then return end
 end)
 
 -- ═══════════════════════════════════════════════════════════════
