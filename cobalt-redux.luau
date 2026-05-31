@@ -138,7 +138,7 @@ local St = {
     triggerDelay = 0.08,
     triggerRandom = 0.03,
     triggerMaxDist = 500,
-    triggerRadius = 32,
+    triggerRadius = 40,
     -- Extended ESP
     espSkeleton = false,
     espHeadCircle = false,
@@ -579,12 +579,25 @@ function canAim()
     return true
 end
 
-function ignoreList()
+function shouldWallbangIgnoreMap()
+    return rageActive() and St.wallbang
+end
+
+function visibilityIgnoreList()
     local t = {}
     if LocalPlayer.Character then
         t[#t + 1] = LocalPlayer.Character
     end
-    if St.wallbang or rageActive() then
+    local cam = workspace.CurrentCamera
+    if cam then
+        t[#t + 1] = cam
+    end
+    return t
+end
+
+function ignoreList()
+    local t = visibilityIgnoreList()
+    if shouldWallbangIgnoreMap() then
         for _, n in ipairs(MAP_FOLDERS) do
             local f = workspace:FindFirstChild(n)
             if f then t[#t + 1] = f end
@@ -593,15 +606,39 @@ function ignoreList()
     return t
 end
 
+function isPhysicallyVisible(origin, part, char)
+    if not part or not char then return false end
+
+    local checkParts = { part }
+    local head = char:FindFirstChild("Head")
+    if head and head ~= part then
+        checkParts[#checkParts + 1] = head
+    end
+    local root = getRoot(char)
+    if root and root ~= part and root ~= head then
+        checkParts[#checkParts + 1] = root
+    end
+
+    local filter = visibilityIgnoreList()
+    for _, checkPart in ipairs(checkParts) do
+        local p = RaycastParams.new()
+        p.FilterType = Enum.RaycastFilterType.Exclude
+        p.FilterDescendantsInstances = filter
+        p.IgnoreWater = true
+        local delta = checkPart.Position - origin
+        if delta.Magnitude > 0.05 then
+            local hit = workspace:Raycast(origin, delta, p)
+            if not hit or hit.Instance:IsDescendantOf(char) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
 function isVisible(origin, part, char)
-    if not part then return false end
-    local p = RaycastParams.new()
-    p.FilterType = Enum.RaycastFilterType.Exclude
-    p.FilterDescendantsInstances = ignoreList()
-    p.IgnoreWater = true
-    local hit = workspace:Raycast(origin, part.Position - origin, p)
-    if not hit then return true end
-    return hit.Instance:IsDescendantOf(char)
+    if not St.visibleCheck then return true end
+    return isPhysicallyVisible(origin, part, char)
 end
 
 function screenDist(part)
@@ -622,28 +659,31 @@ end
 function bestTarget()
     local cam = workspace.CurrentCamera
     if not cam then return nil end
+    local myRoot = getRoot(getChar(LocalPlayer))
+    local origin = myRoot and myRoot.Position or cam.CFrame.Position
+    local maxFov = rageActive() and math.huge or St.fov
+    local needVis = St.visibleCheck and not rageActive()
+    local useDist = St.targetPriority == 2 or rageActive()
+
     if St.priorityUserId then
         local pri = Players:GetPlayerByUserId(St.priorityUserId)
         if pri and isEnemy(pri) then
             local part = getHitPart(getChar(pri))
             if part then
-                local sd = screenDist(part)
-                local maxFov = rageActive() and math.huge or St.fov
-                if sd <= maxFov then return pri end
+                local sd = rageActive() and 0 or screenDist(part)
+                if sd <= maxFov and (not needVis or isVisible(cam.CFrame.Position, part, getChar(pri))) then
+                    return pri
+                end
             end
         end
     end
-    local maxFov = rageActive() and math.huge or St.fov
-    local needVis = St.visibleCheck and not rageActive() and not (St.wallbang or rageActive())
-    local myRoot = getRoot(getChar(LocalPlayer))
-    local origin = myRoot and myRoot.Position or cam.CFrame.Position
+
     local best, bestScore = nil, math.huge
-    local useDist = St.targetPriority == 2
     for _, plr in ipairs(Players:GetPlayers()) do
         if isEnemy(plr) then
             local part = getHitPart(getChar(plr))
             if part then
-                local sd = rageActive() and 0 or screenDist(part)
+                local sd = screenDist(part)
                 if sd <= maxFov then
                     if not needVis or isVisible(cam.CFrame.Position, part, getChar(plr)) then
                         local score = useDist and worldDist(plr, origin) or sd
@@ -703,7 +743,9 @@ function aimAtTarget(part, snap)
     end
 
     if rageActive() then
-        cam.CFrame = CFrame.new(cam.CFrame.Position, targetPos)
+        if not St.desyncOrbit then
+            cam.CFrame = CFrame.new(cam.CFrame.Position, targetPos)
+        end
         aimViaMouse()
         return true
     end
@@ -738,23 +780,27 @@ end
 
 function fireClick()
     pcall(function()
+        local char = getChar(LocalPlayer)
+        if char then
+            local tool = char:FindFirstChildOfClass("Tool")
+            if tool then
+                tool:Activate()
+            end
+        end
         if VirtualInputManager then
             local mp = screenMouse()
             VirtualInputManager:SendMouseButtonEvent(mp.X, mp.Y, 0, true, game, 0)
             VirtualInputManager:SendMouseButtonEvent(mp.X, mp.Y, 0, false, game, 0)
-            return
         end
         if mouse1press and mouse1release then
             mouse1press()
             mouse1release()
-            return
-        end
-        if mouse1click then
+        elseif mouse1click then
             mouse1click()
-            return
+        else
+            pcall(function() VirtualUser:CaptureController() end)
+            VirtualUser:ClickButton1(Vector2.new(0, 0))
         end
-        pcall(function() VirtualUser:CaptureController() end)
-        VirtualUser:ClickButton1(Vector2.new(0, 0))
     end)
 end
 
@@ -1118,7 +1164,7 @@ function updateEsp()
                 if dist <= St.espMaxDist then
                     local e = ensureEsp(plr)
                     local head = char:FindFirstChild("Head") or root
-                    local visible = isVisible(cam.CFrame.Position, head, char)
+                    local visible = isPhysicallyVisible(cam.CFrame.Position, head, char)
                     local col = espColorFor(plr, visible)
 
                     if St.espChams then
@@ -1575,10 +1621,14 @@ function crosshairTarget()
     local origin = cam.CFrame.Position
     local mp = viewportMouse()
 
+    local function passesVisible(part, char)
+        return not St.visibleCheck or isVisible(origin, part, char)
+    end
+
     local ray = cam:ViewportPointToRay(mp.X, mp.Y)
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = { LocalPlayer.Character }
+    params.FilterDescendantsInstances = visibilityIgnoreList()
     params.IgnoreWater = true
     local hit = workspace:Raycast(ray.Origin, ray.Direction * St.triggerMaxDist, params)
     if hit then
@@ -1587,7 +1637,7 @@ function crosshairTarget()
             local plr = Players:GetPlayerFromCharacter(model)
             if plr and isEnemy(plr) then
                 local part = hit.Instance:IsA("BasePart") and hit.Instance or getHitPart(model)
-                if part and isVisible(origin, part, model) then
+                if part and passesVisible(part, model) then
                     return plr
                 end
             end
@@ -1606,7 +1656,7 @@ function crosshairTarget()
                     local part = getHitPart(char)
                     if part then
                         local sd = screenDist(part)
-                        if sd <= bestDist and isVisible(origin, part, char) then
+                        if sd <= bestDist and passesVisible(part, char) then
                             bestDist = sd
                             best = plr
                         end
@@ -1621,6 +1671,7 @@ end
 function triggerbotStep()
     if not St.running or not St.triggerbot then return end
     if rageActive() then return end
+    if not getChar(LocalPlayer) then return end
     local target = crosshairTarget()
     if not target then return end
     local now = tick()
@@ -1652,6 +1703,7 @@ function restoreMovement()
     if hum then
         hum.WalkSpeed = DefaultWalkSpeed
         hum.JumpPower = DefaultJumpPower
+        hum.PlatformStand = false
     end
     workspace.Gravity = DefaultGravity
     setNoclip(false)
@@ -1668,6 +1720,7 @@ function updateMovement(dt)
     if St.fly then
         local cam = workspace.CurrentCamera
         if not cam then return end
+        hum.PlatformStand = true
         local move = Vector3.zero
         if UserInputService:IsKeyDown(Enum.KeyCode.W) then move += cam.CFrame.LookVector end
         if UserInputService:IsKeyDown(Enum.KeyCode.S) then move -= cam.CFrame.LookVector end
@@ -1675,12 +1728,15 @@ function updateMovement(dt)
         if UserInputService:IsKeyDown(Enum.KeyCode.D) then move += cam.CFrame.RightVector end
         if UserInputService:IsKeyDown(Enum.KeyCode.Space) then move += Vector3.new(0, 1, 0) end
         if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then move -= Vector3.new(0, 1, 0) end
+        move = Vector3.new(move.X, move.Y, move.Z)
         if move.Magnitude > 0 then
-            root.Velocity = move.Unit * St.flySpeed
+            root.AssemblyLinearVelocity = move.Unit * St.flySpeed
         else
-            root.Velocity = Vector3.zero
+            root.AssemblyLinearVelocity = Vector3.zero
         end
-        hum:ChangeState(Enum.HumanoidStateType.Physics)
+        root.AssemblyAngularVelocity = Vector3.zero
+    elseif hum.PlatformStand then
+        hum.PlatformStand = false
     end
 end
 
@@ -1933,9 +1989,10 @@ function getRageTarget()
     if OrbitTarget and isEnemy(OrbitTarget) then
         return OrbitTarget
     end
+    local prev = OrbitTarget
     local next = lockOrbitTarget()
-    if next and Ref.rageBanner then
-        notify("New target: " .. next.DisplayName, Color3.fromRGB(255, 160, 80))
+    if next and next ~= prev then
+        notify("Locked: " .. next.DisplayName, Color3.fromRGB(255, 160, 80))
     end
     return next
 end
@@ -2016,11 +2073,17 @@ function updateOrbit(dt)
     if not tRoot then return end
 
     OrbitAngle = OrbitAngle + St.orbitSpeed * dt
-    local off = Vector3.new(math.cos(OrbitAngle), 1.2, math.sin(OrbitAngle)) * St.orbitRadius
-    LastCombatCF = CFrame.new(tRoot.Position + off, tRoot.Position)
+    local off = Vector3.new(math.cos(OrbitAngle), 0.8, math.sin(OrbitAngle)) * St.orbitRadius
+    local orbitPos = tRoot.Position + off
+    LastCombatCF = CFrame.new(orbitPos, tRoot.Position)
     myRoot.CFrame = LastCombatCF
     myRoot.AssemblyLinearVelocity = Vector3.zero
     myRoot.AssemblyAngularVelocity = Vector3.zero
+
+    local hum = getHum(getChar(LocalPlayer))
+    if hum then
+        hum:ChangeState(Enum.HumanoidStateType.Running)
+    end
 end
 
 function aimStatusText()
@@ -2115,10 +2178,11 @@ function combatStep()
     if rageActive() then
         local target = getRageTarget()
         if target then
-            aimAtTarget(getHitPart(getChar(target)), true)
-            if St.autoFire then
+            local part = getHitPart(getChar(target))
+            if part then
+                aimAtTarget(part, true)
                 local now = tick()
-                if now - LastFire >= 1 / 30 then
+                if now - LastFire >= 1 / 20 then
                     LastFire = now
                     fireClick()
                 end
@@ -6882,7 +6946,7 @@ connect(RunService.RenderStepped, function(dt)
     end
 
     espTick = espTick + dt
-    if espTick >= 0.125 then
+    if espTick >= 0.066 then
         espTick = 0
         if St.espEnabled or St.espChams then
             updateEsp()
