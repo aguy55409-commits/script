@@ -1,7 +1,7 @@
 --[[
     Cobalt Redux — Legit combat module (Randomizer Redux)
     GUI: Linoria-style linear init (loads immediately)
-    Legit: Camera aim + silent wallbang (raycast-only, no teleport)
+    Legit: Camera aim + silent aim + wallbang (Mouse/raycast hooks, no teleport)
 ]]
 
 local Players = game:GetService("Players")
@@ -103,6 +103,7 @@ local St = {
     aimToggled = false,
     aimHold = false,
     aimOnShoot = true,
+    silentAim = false,
     showFov = true,
     fov = 120,
     smooth = 0.25,
@@ -189,7 +190,7 @@ local FovCircle = nil
 local ToastGui = nil
 local WmOuter = nil
 local BindOverlayOuter = nil
-local RebindIgnoreUntil = 0
+local RebindIgnoreMouseUntil = 0
 local ProfileNameBox = nil
 local ConfigStatusLbl = nil
 local ProfileListFrame = nil
@@ -212,11 +213,13 @@ local DefaultGravity = workspace.Gravity
 local SpinAngle = 0
 local LastTrigger = 0
 local WallbangTargetPart = nil
+local CombatTargetPlayer = nil
 local WallbangLockedPlayer = nil
 local WallbangHookUntil = 0
 local WallbangPlayerMouse = nil
 local WallbangHookInstalled = false
 local OldWallbangNamecall = nil
+local OldCombatIndex = nil
 local WallbangCheckCaller = checkcaller or function() return false end
 local WallbangGetNamecallMethod = getnamecallmethod or function() return "" end
 local NoclipParts = {}
@@ -473,45 +476,43 @@ function isMouseBindInput(input)
         or input.UserInputType == Enum.UserInputType.MouseButton3
 end
 
-function cancelRebind()
-    St.rebinding = nil
-    RebindIgnoreUntil = 0
-    updateStatusLabels()
-end
+local updateStatusLabels
 
-function startRebind(mode)
-    St.rebinding = mode
-    RebindIgnoreUntil = tick() + 0.35
-    updateStatusLabels()
-    if mode == "aim" then
-        notify("Press a key or mouse button for aim bind", Accent)
-    elseif mode == "wallbang" then
-        notify("Press a keyboard key for wallbang (Esc to cancel)", Accent)
-    end
+function stopRebindListening()
+    St.rebinding = nil
+    RebindIgnoreMouseUntil = 0
+    if updateStatusLabels then updateStatusLabels() end
 end
 
 function processRebindInput(input)
     if not St.rebinding then return false end
-    if tick() < RebindIgnoreUntil then return true end
+
+    if isMouseBindInput(input) and tick() < RebindIgnoreMouseUntil then
+        return true
+    end
 
     if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == Enum.KeyCode.Escape then
-        cancelRebind()
+        stopRebindListening()
         notify("Rebind cancelled", Color3.fromRGB(180, 180, 180))
         return true
     end
 
     if St.rebinding == "aim" then
         if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode ~= Enum.KeyCode.Unknown then
+            if input.KeyCode == MENU_TOGGLE_KEY then
+                notify("RightShift is reserved for menu toggle", Color3.fromRGB(255, 120, 80))
+                return true
+            end
             St.aimBindType = "key"
             St.aimKey = input.KeyCode
-            cancelRebind()
+            stopRebindListening()
             notify("Aim bind: " .. keyLabel(St.aimKey), Accent)
             return true
         end
         if isMouseBindInput(input) then
             St.aimBindType = "mouse"
             St.aimMouse = input.UserInputType
-            cancelRebind()
+            stopRebindListening()
             notify("Aim bind: " .. mouseBindLabel(St.aimMouse), Accent)
             return true
         end
@@ -520,8 +521,12 @@ function processRebindInput(input)
 
     if St.rebinding == "wallbang" then
         if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode ~= Enum.KeyCode.Unknown then
+            if input.KeyCode == MENU_TOGGLE_KEY then
+                notify("RightShift is reserved for menu toggle", Color3.fromRGB(255, 120, 80))
+                return true
+            end
             St.wallbangKey = input.KeyCode
-            cancelRebind()
+            stopRebindListening()
             notify("Wallbang bind: " .. keyLabel(St.wallbangKey), Accent)
             return true
         end
@@ -529,6 +534,21 @@ function processRebindInput(input)
     end
 
     return false
+end
+
+function startRebind(mode)
+    stopRebindListening()
+    St.rebinding = mode
+    RebindIgnoreMouseUntil = tick() + 0.2
+    if ProfileNameBox then
+        pcall(function() ProfileNameBox:ReleaseFocus() end)
+    end
+    if updateStatusLabels then updateStatusLabels() end
+    if mode == "aim" then
+        notify("Press a key or mouse button for aim bind (Esc cancel)", Accent)
+    elseif mode == "wallbang" then
+        notify("Press a keyboard key for wallbang (Esc cancel)", Accent)
+    end
 end
 
 function handleAimBindBegan()
@@ -605,11 +625,15 @@ end
 
 function refreshAimHoldState()
     if not St.aimbot or St.aimMode ~= 3 then return end
+    local hold = false
     if St.aimBindType == "mouse" then
-        St.aimHold = UserInputService:IsMouseButtonPressed(St.aimMouse)
+        hold = UserInputService:IsMouseButtonPressed(St.aimMouse)
     else
-        St.aimHold = UserInputService:IsKeyDown(St.aimKey)
+        hold = UserInputService:IsKeyDown(St.aimKey)
     end
+    if hold == St.aimHold then return end
+    St.aimHold = hold
+    updateStatusLabels()
 end
 
 function getChar(plr)
@@ -687,6 +711,226 @@ function canAim()
     return true
 end
 
+function combatBypassVis()
+    return (St.silentAim or St.wallbang) and isFiring()
+end
+
+function visibilityIgnoreList()
+    local t = {}
+    if LocalPlayer.Character then
+        t[#t + 1] = LocalPlayer.Character
+    end
+    local cam = workspace.CurrentCamera
+    if cam then
+        t[#t + 1] = cam
+    end
+    return t
+end
+
+function shouldWallbangIgnoreMap()
+    return wallbangPenetrationActive()
+end
+
+function ignoreList()
+    local t = visibilityIgnoreList()
+    if shouldWallbangIgnoreMap() then
+        for _, n in ipairs(MAP_FOLDERS) do
+            local f = workspace:FindFirstChild(n)
+            if f then t[#t + 1] = f end
+        end
+    end
+    return t
+end
+
+function isPhysicallyVisible(origin, part, char)
+    if not part or not char then return false end
+
+    local checkParts = { part }
+    local head = char:FindFirstChild("Head")
+    if head and head ~= part then
+        checkParts[#checkParts + 1] = head
+    end
+    local root = getRoot(char)
+    if root and root ~= part and root ~= head then
+        checkParts[#checkParts + 1] = root
+    end
+
+    local filter = visibilityIgnoreList()
+    for _, checkPart in ipairs(checkParts) do
+        local p = RaycastParams.new()
+        p.FilterType = Enum.RaycastFilterType.Exclude
+        p.FilterDescendantsInstances = filter
+        p.IgnoreWater = true
+        local delta = checkPart.Position - origin
+        if delta.Magnitude > 0.05 then
+            local hit = workspace:Raycast(origin, delta, p)
+            if not hit or hit.Instance:IsDescendantOf(char) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function isVisible(origin, part, char)
+    if not St.visibleCheck then return true end
+    return isPhysicallyVisible(origin, part, char)
+end
+
+function screenDist(part)
+    local cam = workspace.CurrentCamera
+    if not cam or not part then return math.huge end
+    local sp, on = cam:WorldToViewportPoint(part.Position)
+    if not on or sp.Z < 0 then return math.huge end
+    local mp = mousePos()
+    return (Vector2.new(sp.X, sp.Y) - Vector2.new(mp.X, mp.Y)).Magnitude
+end
+
+function worldDist(plr, origin)
+    local root = getRoot(getChar(plr))
+    if not root or not origin then return math.huge end
+    return (root.Position - origin).Magnitude
+end
+
+function bestTarget()
+    local cam = workspace.CurrentCamera
+    if not cam then return nil end
+    local myRoot = getRoot(getChar(LocalPlayer))
+    local origin = myRoot and myRoot.Position or cam.CFrame.Position
+    local maxFov = St.fov
+    local needVis = St.visibleCheck and not combatBypassVis()
+    local useDist = St.targetPriority == 2
+
+    if St.priorityUserId then
+        local pri = Players:GetPlayerByUserId(St.priorityUserId)
+        if pri and isEnemy(pri) then
+            local part = getHitPart(getChar(pri))
+            if part then
+                local sd = screenDist(part)
+                if sd <= maxFov and (not needVis or isVisible(cam.CFrame.Position, part, getChar(pri))) then
+                    return pri
+                end
+            end
+        end
+    end
+
+    local best, bestScore = nil, math.huge
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if isEnemy(plr) then
+            local part = getHitPart(getChar(plr))
+            if part then
+                local sd = screenDist(part)
+                if sd <= maxFov then
+                    if not needVis or isVisible(cam.CFrame.Position, part, getChar(plr)) then
+                        local score = useDist and worldDist(plr, origin) or sd
+                        if score < bestScore then
+                            bestScore = score
+                            best = plr
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+function getAimPoint()
+    return viewportMouse()
+end
+
+function sendMouseDelta(dx, dy, absX, absY)
+    local moved = false
+    pcall(function()
+        if mouseMoveRel then
+            mouseMoveRel(dx, dy)
+            moved = true
+        elseif mouseMoveAbs and absX and absY then
+            local sx, sy = viewportToScreen(absX, absY)
+            mouseMoveAbs(sx, sy)
+            moved = true
+        elseif VirtualInputManager then
+            local mp = screenMouse()
+            VirtualInputManager:SendMouseMoveEvent(mp.X + dx, mp.Y + dy, game)
+            moved = true
+        end
+    end)
+    return moved
+end
+
+function aimAtTarget(part, snap)
+    local cam = workspace.CurrentCamera
+    if not cam or not part then return false end
+    local targetPos = part.Position
+    local instant = snap
+
+    local function aimViaMouse()
+        local sp, on = cam:WorldToViewportPoint(targetPos)
+        if not on or sp.Z < 0 then return false end
+        local ap = getAimPoint()
+        local dx, dy = sp.X - ap.X, sp.Y - ap.Y
+        if math.abs(dx) < 0.25 and math.abs(dy) < 0.25 then return true end
+        if instant then
+            return sendMouseDelta(dx, dy, sp.X, sp.Y)
+        end
+        local sens = math.max(0.05, St.smooth) * 6
+        return sendMouseDelta(dx / sens, dy / sens, ap.X + dx / sens, ap.Y + dy / sens)
+    end
+
+    if St.thirdPerson then
+        return aimViaMouse()
+    end
+
+    local goal = CFrame.new(cam.CFrame.Position, targetPos)
+    if instant then
+        cam.CFrame = goal
+    else
+        local alpha = clamp(1 - St.smooth, 0.08, 1)
+        cam.CFrame = cam.CFrame:Lerp(goal, alpha)
+    end
+
+    local sp, on = cam:WorldToViewportPoint(targetPos)
+    if on and sp.Z > 0 then
+        local ap = getAimPoint()
+        local dx, dy = sp.X - ap.X, sp.Y - ap.Y
+        if math.abs(dx) > 0.5 or math.abs(dy) > 0.5 then
+            if instant then
+                sendMouseDelta(dx, dy, sp.X, sp.Y)
+            else
+                local sens = math.max(0.05, St.smooth) * 6
+                sendMouseDelta(dx / sens, dy / sens, ap.X + dx / sens, ap.Y + dy / sens)
+            end
+        end
+    end
+    return true
+end
+
+function fireClick()
+    pcall(function()
+        local char = getChar(LocalPlayer)
+        if char then
+            local tool = char:FindFirstChildOfClass("Tool")
+            if tool then
+                tool:Activate()
+            end
+        end
+        if VirtualInputManager then
+            local mp = screenMouse()
+            VirtualInputManager:SendMouseButtonEvent(mp.X, mp.Y, 0, true, game, 0)
+            VirtualInputManager:SendMouseButtonEvent(mp.X, mp.Y, 0, false, game, 0)
+        end
+        if mouse1press and mouse1release then
+            mouse1press()
+            mouse1release()
+        elseif mouse1click then
+            mouse1click()
+        else
+            pcall(function() VirtualUser:CaptureController() end)
+            VirtualUser:ClickButton1(Vector2.new(0, 0))
+        end
+    end)
+end
+
 function wallbangShootActive()
     if not St.wallbang then return false end
     return isFiring()
@@ -709,11 +953,33 @@ function refreshWallbangLock()
     end
 end
 
-function syncWallbangTargetPart()
-    if WallbangLockedPlayer and isEnemy(WallbangLockedPlayer) then
-        WallbangTargetPart = getHitPart(getChar(WallbangLockedPlayer))
+function refreshCombatTarget()
+    CombatTargetPlayer = nil
+    WallbangTargetPart = nil
+
+    if St.wallbang then
+        refreshWallbangLock()
     else
-        WallbangTargetPart = nil
+        WallbangLockedPlayer = nil
+    end
+
+    if St.wallbang and wallbangActive() and WallbangLockedPlayer and isEnemy(WallbangLockedPlayer) then
+        CombatTargetPlayer = WallbangLockedPlayer
+        WallbangTargetPart = getHitPart(getChar(WallbangLockedPlayer))
+        return
+    end
+
+    local wantTarget = false
+    if St.silentAim and isFiring() then wantTarget = true end
+    if St.wallbang and wallbangActive() and isFiring() then wantTarget = true end
+    if tick() <= WallbangHookUntil then wantTarget = true end
+
+    if wantTarget then
+        local target = bestTarget()
+        if target then
+            CombatTargetPlayer = target
+            WallbangTargetPart = getHitPart(getChar(target))
+        end
     end
 end
 
@@ -722,11 +988,6 @@ function getWallbangLockName()
         return WallbangLockedPlayer.DisplayName
     end
     return nil
-end
-
-
-function shouldWallbangIgnoreMap()
-    return wallbangHooksActive()
 end
 
 function wallbangMapInstances()
@@ -827,7 +1088,7 @@ end
 
 function getWallbangMouseHitCFrame()
     local hitPos = WallbangTargetPart and WallbangTargetPart.Position or getWallbangShotOrigin()
-    local dir = getWallbangShotDirection()
+    local dir = getWallbangShotDirection() or Vector3.new(0, 0, -1)
     return CFrame.new(hitPos, hitPos + dir)
 end
 
@@ -845,7 +1106,7 @@ function fakeRaycastResult(origin, part)
 end
 
 function redirectFindPartResult(part, pos)
-    if not wallbangHooksActive() or not WallbangTargetPart then
+    if not combatRedirectActive() or not WallbangTargetPart then
         return part, pos
     end
     if isWallbangTargetHit(part) then
@@ -856,29 +1117,73 @@ end
 
 function isLocalWallbangOrigin(origin)
     if typeof(origin) ~= "Vector3" then return false end
+    local cam = workspace.CurrentCamera
+    if cam and (origin - cam.CFrame.Position).Magnitude < 14 then return true end
     local root = getRoot(getChar(LocalPlayer))
     if not root then return false end
     return (origin - root.Position).Magnitude < 14
 end
 
-function wallbangPenetrationActive()
-    if not St.wallbang or not St.running then return false end
-    if not wallbangActive() then return false end
-    syncWallbangTargetPart()
-    if not WallbangTargetPart or not WallbangTargetPart.Parent then return false end
-    if isFiring() then
-        WallbangHookUntil = tick() + 0.08
-        return true
-    end
+function combatRedirectActive()
+    if not St.running or not WallbangTargetPart or not WallbangTargetPart.Parent then return false end
+    if St.silentAim and isFiring() then return true end
+    if St.wallbang and wallbangActive() and isFiring() then return true end
     return tick() <= WallbangHookUntil
 end
 
-function wallbangHooksActive()
-    return wallbangPenetrationActive()
+function combatHooksActive()
+    if not St.silentAim and not St.wallbang then return false end
+    return combatRedirectActive()
 end
 
-local function removeWallbangHooks()
+function wallbangPenetrationActive()
+    return St.wallbang and combatHooksActive()
+end
+
+function wallbangHooksActive()
+    return combatHooksActive()
+end
+
+function rewriteCombatFireArgs(args)
+    if not WallbangTargetPart then return false end
+    local changed = false
+    for i, arg in ipairs(args) do
+        local t = typeof(arg)
+        if t == "Ray" then
+            local origin = arg.Origin
+            local dist = arg.Direction.Magnitude
+            if dist <= 0 then dist = 512 end
+            local dir = WallbangTargetPart.Position - origin
+            if dir.Magnitude > 0.05 then
+                args[i] = Ray.new(origin, dir.Unit * dist)
+                changed = true
+            end
+        elseif t == "Vector3" then
+            local cam = workspace.CurrentCamera
+            if cam and (arg - cam.CFrame.Position).Magnitude > 3 then
+                args[i] = WallbangTargetPart.Position
+                changed = true
+            end
+        elseif t == "Instance" and arg:IsA("BasePart") and CombatTargetPlayer then
+            local tchar = getChar(CombatTargetPlayer)
+            if tchar and arg:IsDescendantOf(tchar) then
+                args[i] = WallbangTargetPart
+                changed = true
+            end
+        end
+    end
+    return changed
+end
+
+local function removeCombatHooks()
     if not WallbangHookInstalled then return end
+    if OldCombatIndex then
+        if unhookmetamethod then
+            pcall(function() unhookmetamethod(game, "__index", OldCombatIndex) end)
+        elseif restorefunction and isfunctionhooked and isfunctionhooked(OldCombatIndex) then
+            pcall(restorefunction, OldCombatIndex)
+        end
+    end
     if OldWallbangNamecall then
         if unhookmetamethod then
             pcall(function() unhookmetamethod(game, "__namecall", OldWallbangNamecall) end)
@@ -886,30 +1191,60 @@ local function removeWallbangHooks()
             pcall(restorefunction, OldWallbangNamecall)
         end
     end
+    OldCombatIndex = nil
     OldWallbangNamecall = nil
     WallbangHookInstalled = false
 end
 
-function ensureWallbangHooks()
-    if not St.wallbang or WallbangHookInstalled or not hookmetamethod then return end
+function ensureCombatHooks()
+    if WallbangHookInstalled or not hookmetamethod then return end
+    if not St.silentAim and not St.wallbang then return end
     local wrap = newcclosure or function(f) return f end
 
+    local function bindMouse()
+        pcall(function() WallbangPlayerMouse = LocalPlayer:GetMouse() end)
+    end
+    bindMouse()
+    connect(LocalPlayer.CharacterAdded, function()
+        task.defer(bindMouse)
+    end)
+
+    OldCombatIndex = hookmetamethod(game, "__index", wrap(function(self, key)
+        if not WallbangCheckCaller() and combatRedirectActive() and WallbangPlayerMouse and self == WallbangPlayerMouse then
+            if key == "Hit" then
+                return getWallbangMouseHitCFrame()
+            elseif key == "Target" then
+                return WallbangTargetPart
+            elseif key == "UnitRay" then
+                return getWallbangUnitRay()
+            end
+        end
+        return OldCombatIndex(self, key)
+    end))
+
     OldWallbangNamecall = hookmetamethod(game, "__namecall", wrap(function(self, ...)
-        if WallbangCheckCaller() or not wallbangHooksActive() then
+        if WallbangCheckCaller() or not combatRedirectActive() then
             return OldWallbangNamecall(self, ...)
         end
         local method = WallbangGetNamecallMethod()
-        if method == "Raycast" then
+        if method == "FireServer" or method == "InvokeServer" then
+            local args = { ... }
+            if rewriteCombatFireArgs(args) then
+                return OldWallbangNamecall(self, table.unpack(args))
+            end
+        elseif method == "Raycast" then
             local origin, direction, params = ...
             if isLocalWallbangOrigin(origin) and WallbangTargetPart then
-                local merged = mergeRaycastParams(params)
                 local mag = typeof(direction) == "Vector3" and direction.Magnitude or 512
                 if mag < 1 then mag = 512 end
                 local aimDir = getWallbangShotDirection()
                 if aimDir then
+                    local merged = wallbangPenetrationActive() and mergeRaycastParams(params) or params
                     local result = OldWallbangNamecall(self, origin, aimDir * mag, merged)
-                    if not result or not isWallbangTargetHit(result.Instance) then
-                        return fakeRaycastResult(origin, WallbangTargetPart)
+                    if wallbangPenetrationActive() then
+                        if not result or not isWallbangTargetHit(result.Instance) then
+                            return fakeRaycastResult(origin, WallbangTargetPart)
+                        end
                     end
                     return result
                 end
@@ -919,7 +1254,9 @@ function ensureWallbangHooks()
             local ray = args[1]
             if ray and isLocalWallbangOrigin(ray.Origin) and WallbangTargetPart then
                 args[1] = getWallbangUnitRay()
-                args[2] = mergeRayIgnoreList(args[2])
+                if wallbangPenetrationActive() then
+                    args[2] = mergeRayIgnoreList(args[2])
+                end
                 local packed = { OldWallbangNamecall(self, table.unpack(args)) }
                 packed[1], packed[2] = redirectFindPartResult(packed[1], packed[2])
                 return table.unpack(packed)
@@ -931,26 +1268,44 @@ function ensureWallbangHooks()
                 packed[1], packed[2] = redirectFindPartResult(packed[1], packed[2])
                 return table.unpack(packed)
             end
+        elseif method == "ViewportPointToRay" or method == "ScreenPointToRay" then
+            if WallbangTargetPart and self == workspace.CurrentCamera then
+                local cam = workspace.CurrentCamera
+                if cam then
+                    local origin = cam.CFrame.Position
+                    local dir = WallbangTargetPart.Position - origin
+                    if dir.Magnitude > 0.05 then
+                        return Ray.new(origin, dir.Unit)
+                    end
+                end
+            end
         end
         return OldWallbangNamecall(self, ...)
     end))
     WallbangHookInstalled = true
 end
 
-function syncWallbangHookState()
-    local armed = St.wallbang and wallbangActive()
-        and WallbangLockedPlayer and isEnemy(WallbangLockedPlayer)
-    if armed then
-        ensureWallbangHooks()
+function syncCombatHookState()
+    if St.silentAim or St.wallbang then
+        ensureCombatHooks()
     else
-        removeWallbangHooks()
+        removeCombatHooks()
+        CombatTargetPlayer = nil
+        WallbangTargetPart = nil
     end
 end
+
+removeWallbangHooks = removeCombatHooks
+ensureWallbangHooks = ensureCombatHooks
+syncWallbangHookState = syncCombatHookState
 
 function clearWallbangShot()
     St.wallbangToggled = false
     St.wallbangHold = false
     clearWallbangLock()
+    CombatTargetPlayer = nil
+    WallbangTargetPart = nil
+    WallbangHookUntil = 0
 end
 
 function ensureEspFolder()
@@ -1498,6 +1853,7 @@ function serializeSettings()
         aimKey = keyCodeToName(St.aimKey), aimBindType = St.aimBindType,
         aimMouse = mouseTypeToName(St.aimMouse),
         aimOnShoot = St.aimOnShoot,
+        silentAim = St.silentAim,
         showFov = St.showFov, fov = St.fov, smooth = St.smooth,
         visibleCheck = St.visibleCheck, hitPart = St.hitPart,
         teamCheck = St.teamCheck, targetPriority = St.targetPriority,
@@ -1565,6 +1921,7 @@ function applySettings(data, opts)
     if type(data.aimBindType) == "string" then St.aimBindType = data.aimBindType end
     if type(data.aimMouse) == "string" then St.aimMouse = applyMouseFromName(data.aimMouse, St.aimMouse) end
     applyBoolField(data, "aimOnShoot")
+    applyBoolField(data, "silentAim", Ref.silentAimToggle)
     applyBoolField(data, "showFov")
     applyBoolField(data, "wallbang", Ref.wallbangToggle)
     if type(data.wallbangKey) == "string" then St.wallbangKey = applyKeyFromName(data.wallbangKey, St.wallbangKey) end
@@ -1617,6 +1974,7 @@ function applySettings(data, opts)
     end
     if applyProfileBoolFields then applyProfileBoolFields(data) end
     if applyProfileNumFields then applyProfileNumFields(data) end
+    syncCombatHookState()
     updateStatusLabels()
     updatePlayerList()
     if Ref.featureCheckLbl then Ref.featureCheckLbl.Text = getFeatureChecklistText() end
@@ -2130,6 +2488,22 @@ function updateBindOverlay()
         end
     end
 
+    if Ref.bind_silent_key then
+        if not St.silentAim then
+            Ref.bind_silent_key.Text = "—"
+            Ref.bind_silent_status.Text = "DISABLED"
+            Ref.bind_silent_status.TextColor3 = Color3.fromRGB(120, 120, 120)
+        elseif combatRedirectActive() then
+            Ref.bind_silent_key.Text = "LMB"
+            Ref.bind_silent_status.Text = "ACTIVE"
+            Ref.bind_silent_status.TextColor3 = Color3.fromRGB(80, 255, 120)
+        else
+            Ref.bind_silent_key.Text = "LMB"
+            Ref.bind_silent_status.Text = "ON"
+            Ref.bind_silent_status.TextColor3 = Color3.fromRGB(170, 210, 255)
+        end
+    end
+
     if Ref.bind_menu_status then
         Ref.bind_menu_key.Text = "[RShift]"
         Ref.bind_menu_status.Text = St.uiHidden and "HIDDEN" or "OPEN"
@@ -2138,7 +2512,7 @@ function updateBindOverlay()
 end
 
 
-function updateStatusLabels()
+updateStatusLabels = function()
     if Ref.aimKeyLbl then
         if St.rebinding == "aim" then
             Ref.aimKeyLbl.Text = "Aim Hold Key: [ press key or mouse... ]"
@@ -2212,8 +2586,6 @@ end
 function combatStep()
     if not St.running then return end
 
-    refreshWallbangLock()
-
     if aimActive() then
         local target = bestTarget()
         if canAim() and target then
@@ -2222,9 +2594,21 @@ function combatStep()
     end
 end
 
+function updateCombatHookWindow()
+    if not St.running then return end
+    if not St.silentAim and not St.wallbang then return end
+    refreshCombatTarget()
+    if WallbangTargetPart and WallbangTargetPart.Parent then
+        if (St.silentAim and isFiring()) or (St.wallbang and wallbangActive() and isFiring()) then
+            WallbangHookUntil = tick() + 0.08
+        end
+    end
+end
+
 function unload()
     St.running = false
-    removeWallbangHooks()
+    stopRebindListening()
+    removeCombatHooks()
     clearWallbangShot()
     clearAllEsp()
     resetAllVisuals()
@@ -2249,6 +2633,7 @@ end
 local PROFILE_BOOL_FIELDS = {
     "aimbot",
     "aimOnShoot",
+    "silentAim",
     "showFov",
     "visibleCheck",
     "teamCheck",
@@ -2369,8 +2754,8 @@ function getProfile_aimbot() return St.aimbot end
 function setProfile_aimbot(v) if type(v) == "boolean" then St.aimbot = v end end
 function getProfile_aimOnShoot() return St.aimOnShoot end
 function setProfile_aimOnShoot(v) if type(v) == "boolean" then St.aimOnShoot = v end end
-function getProfile_silentAim() return false end
-function setProfile_silentAim(_) end
+function getProfile_silentAim() return St.silentAim end
+function setProfile_silentAim(v) if type(v) == "boolean" then St.silentAim = v end end
 function getProfile_showFov() return St.showFov end
 function setProfile_showFov(v) if type(v) == "boolean" then St.showFov = v end end
 function getProfile_visibleCheck() return St.visibleCheck end
@@ -2528,6 +2913,7 @@ end
 function countCombatFeaturesEnabled()
     local n = 0
     if St.aimbot then n += 1 end
+    if St.silentAim then n += 1 end
     if St.triggerbot then n += 1 end
     if St.wallbang then n += 1 end
     return n
@@ -2555,9 +2941,10 @@ end
 local ST_DOCS = {
     aimbot = { type = "boolean", desc = "Enable mouse aimbot", default = "false" },
     aimMode = { type = "number", desc = "1=Always 2=Toggle 3=Hold", default = "2" },
+    silentAim = { type = "boolean", desc = "Redirect Mouse.Hit and remotes to FOV target while firing", default = "false" },
     triggerbot = { type = "boolean", desc = "Auto fire when crosshair on enemy in FOV", default = "false" },
     ragebot = { type = "boolean", desc = "Removed", default = "false" },
-    wallbang = { type = "boolean", desc = "Silent raycast redirect through walls while firing", default = "false" },
+    wallbang = { type = "boolean", desc = "Shoot through walls via raycast map bypass + Mouse hooks", default = "false" },
     espEnabled = { type = "boolean", desc = "Master ESP drawing toggle", default = "false" },
     espSkeleton = { type = "boolean", desc = "Draw R6/R15 bone lines", default = "false" },
     espHeadCircle = { type = "boolean", desc = "Circle at head viewport pos", default = "false" },
@@ -2592,7 +2979,7 @@ end
 
 function doc_aimbot() return ST_DOCS.aimbot.desc end
 function doc_aimMode() return ST_DOCS.aimMode.desc end
-function doc_silentAim() return "Removed — use Wallbang in Legit tab" end
+function doc_silentAim() return ST_DOCS.silentAim.desc end
 function doc_triggerbot() return ST_DOCS.triggerbot.desc end
 function doc_ragebot() return ST_DOCS.ragebot.desc end
 function doc_wallbang() return ST_DOCS.wallbang.desc end
@@ -2654,37 +3041,37 @@ local VIS_DOCS = {
 
 function docVisual_worldTintHue() return VIS_DOCS.worldTintHue.desc end
 function getVisual_worldTintHue() return VisualState.worldTintHue end
-function setVisual_worldTintHue(v) VisualState.worldTintHue = v applyVisualEffects() end
+function setVisual_worldTintHue(v) VisualState.worldTintHue = v; applyVisualEffects() end
 function docVisual_worldTintStrength() return VIS_DOCS.worldTintStrength.desc end
 function getVisual_worldTintStrength() return VisualState.worldTintStrength end
-function setVisual_worldTintStrength(v) VisualState.worldTintStrength = v applyVisualEffects() end
+function setVisual_worldTintStrength(v) VisualState.worldTintStrength = v; applyVisualEffects() end
 function docVisual_saturation() return VIS_DOCS.saturation.desc end
 function getVisual_saturation() return VisualState.saturation end
-function setVisual_saturation(v) VisualState.saturation = v applyVisualEffects() end
+function setVisual_saturation(v) VisualState.saturation = v; applyVisualEffects() end
 function docVisual_contrast() return VIS_DOCS.contrast.desc end
 function getVisual_contrast() return VisualState.contrast end
-function setVisual_contrast(v) VisualState.contrast = v applyVisualEffects() end
+function setVisual_contrast(v) VisualState.contrast = v; applyVisualEffects() end
 function docVisual_brightness() return VIS_DOCS.brightness.desc end
 function getVisual_brightness() return VisualState.brightness end
-function setVisual_brightness(v) VisualState.brightness = v applyVisualEffects() end
+function setVisual_brightness(v) VisualState.brightness = v; applyVisualEffects() end
 function docVisual_blurAmount() return VIS_DOCS.blurAmount.desc end
 function getVisual_blurAmount() return VisualState.blurAmount end
-function setVisual_blurAmount(v) VisualState.blurAmount = v applyVisualEffects() end
+function setVisual_blurAmount(v) VisualState.blurAmount = v; applyVisualEffects() end
 function docVisual_bloomAmount() return VIS_DOCS.bloomAmount.desc end
 function getVisual_bloomAmount() return VisualState.bloomAmount end
-function setVisual_bloomAmount(v) VisualState.bloomAmount = v applyVisualEffects() end
+function setVisual_bloomAmount(v) VisualState.bloomAmount = v; applyVisualEffects() end
 function docVisual_fullbright() return VIS_DOCS.fullbright.desc end
 function getVisual_fullbright() return VisualState.fullbright end
-function setVisual_fullbright(v) VisualState.fullbright = v applyVisualEffects() end
+function setVisual_fullbright(v) VisualState.fullbright = v; applyVisualEffects() end
 function docVisual_noShadows() return VIS_DOCS.noShadows.desc end
 function getVisual_noShadows() return VisualState.noShadows end
-function setVisual_noShadows(v) VisualState.noShadows = v applyVisualEffects() end
+function setVisual_noShadows(v) VisualState.noShadows = v; applyVisualEffects() end
 function docVisual_clockOverride() return VIS_DOCS.clockOverride.desc end
 function getVisual_clockOverride() return VisualState.clockOverride end
-function setVisual_clockOverride(v) VisualState.clockOverride = v applyVisualEffects() end
+function setVisual_clockOverride(v) VisualState.clockOverride = v; applyVisualEffects() end
 function docVisual_clockTime() return VIS_DOCS.clockTime.desc end
 function getVisual_clockTime() return VisualState.clockTime end
-function setVisual_clockTime(v) VisualState.clockTime = v applyVisualEffects() end
+function setVisual_clockTime(v) VisualState.clockTime = v; applyVisualEffects() end
 
 function applyWorldPreset_Sunset()
     VisualState.worldTintHue = 0.08
@@ -6158,6 +6545,7 @@ bindPad.PaddingBottom = UDim.new(0, 6)
 bindPad.Parent = bindStack
 
 createBindOverlayRow(bindStack, "Aimbot", "aim")
+createBindOverlayRow(bindStack, "Silent Aim", "silent")
 createBindOverlayRow(bindStack, "Wallbang", "wallbang")
 createBindOverlayRow(bindStack, "Menu", "menu")
 
@@ -6174,12 +6562,12 @@ ThemeParts.windowInner = WindowInner
 
 label(WindowInner, "Cobalt Redux", 14, UDim2.fromOffset(7, 4), 3)
 
-local TitleDrag = Instance.new("TextButton")
+TitleDrag = Instance.new("TextButton")
 TitleDrag.BackgroundTransparency = 1
 TitleDrag.Position = UDim2.fromOffset(0, 0)
 TitleDrag.Size = UDim2.new(1, 0, 0, 22)
 TitleDrag.Text = ""
-TitleDrag.ZIndex = 10
+TitleDrag.ZIndex = 50
 TitleDrag.Parent = WindowInner
 
 local MainSection = Instance.new("Frame")
@@ -6294,8 +6682,9 @@ local miscStack = makeTab("Misc", TabRow2)
 local legitGuide = makeGroupbox(legitStack, "Quick Start")
 label(legitGuide, "1) Enable Aimbot + set your hold key below", 13, nil, 7)
 label(legitGuide, "2) Set Aim Mode to Hold — hold your key to lock on", 13, nil, 7)
-label(legitGuide, "3) Wallbang (Q): lock target, LMB redirects shots through walls", 13, nil, 7)
-label(legitGuide, "4) Triggerbot: toggle ON = auto shoots visible enemies in crosshair", 13, nil, 7)
+label(legitGuide, "3) Silent Aim: redirects shots to FOV target without moving camera", 13, nil, 7)
+label(legitGuide, "4) Wallbang (Q): lock target + shoot through walls via raycast hooks", 13, nil, 7)
+label(legitGuide, "5) Triggerbot: toggle ON = auto shoots visible enemies in crosshair", 13, nil, 7)
 
 local legitKeys = makeGroupbox(legitStack, "Aimbot Keybinds")
 
@@ -6320,7 +6709,7 @@ makeCycle(legitKeys, "Aim Mode", AIM_MODES, function() return St.aimMode end, fu
 end)
 
 makeButton(legitKeys, "Set Aim Hold Key (keyboard / LMB / RMB / MMB)", function()
-    startRebind("aim")
+    task.defer(function() startRebind("aim") end)
 end)
 
 local legitSettings = makeGroupbox(legitStack, "Aimbot Settings")
@@ -6332,6 +6721,21 @@ Ref.aimbotToggle = makeToggle(legitSettings, "Enable Aimbot", function(v)
         St.aimHold = false
     end
 end, St.aimbot)
+
+Ref.silentAimToggle = makeToggle(legitSettings, "Enable Silent Aim", function(v)
+    St.silentAim = v
+    if not v then
+        CombatTargetPlayer = nil
+        if not St.wallbang then
+            WallbangTargetPart = nil
+            WallbangHookUntil = 0
+        end
+    end
+    syncCombatHookState()
+    updateBindOverlay()
+end, St.silentAim)
+
+label(legitSettings, "Hooks Mouse.Hit + FireServer while LMB held — no camera move", 12, nil, 7)
 
 makeToggle(legitSettings, "Only Aim While Shooting", function(v)
     St.aimOnShoot = v
@@ -6376,8 +6780,8 @@ makeCycle(legitSettings, "Hit Part", HIT_PARTS, function() return St.hitPart end
 end)
 
 local wallbangBox = makeGroupbox(legitStack, "Wallbang")
-label(wallbangBox, "Silent raycast redirect — no teleport, hooks only while firing", 12, nil, 7)
-label(wallbangBox, "Toggle wallbang ON, press Q to lock, shoot through cover", 12, nil, 7)
+label(wallbangBox, "Raycast + Mouse hooks — shoots through map geometry", 12, nil, 7)
+label(wallbangBox, "Enable wallbang, press Q to lock (or auto-target on shoot)", 12, nil, 7)
 
 local wallbangKeyRow = Instance.new("Frame")
 wallbangKeyRow.BackgroundTransparency = 1
@@ -6393,7 +6797,8 @@ Ref.wallbangModeLbl = label(wallbangBox, "Wallbang Mode: Toggle", 13, nil, 7)
 Ref.wallbangToggle = makeToggle(wallbangBox, "Enable Wallbang", function(v)
     St.wallbang = v
     if not v then clearWallbangShot() end
-    syncWallbangHookState()
+    syncCombatHookState()
+    updateBindOverlay()
 end, St.wallbang)
 
 makeCycle(wallbangBox, "Wallbang Mode", AIM_MODES, function() return St.wallbangMode end, function(v)
@@ -6405,7 +6810,7 @@ makeCycle(wallbangBox, "Wallbang Mode", AIM_MODES, function() return St.wallbang
 end)
 
 makeButton(wallbangBox, "Set Wallbang Keybind", function()
-    startRebind("wallbang")
+    task.defer(function() startRebind("wallbang") end)
 end)
 
 local triggerBox = makeGroupbox(legitStack, "Triggerbot")
@@ -6552,47 +6957,47 @@ label(extEspBox, "Visible=green Hidden=red (raycast)", 12, nil, 7)
 
 -- ── World tab ──
 local worldBox = makeGroupbox(worldStack, "World Visuals")
-VisualToggles.fullbright = makeToggle(worldBox, "Fullbright", function(v) VisualState.fullbright = v applyVisualEffects() end, false)
-VisualToggles.noShadows = makeToggle(worldBox, "No Shadows", function(v) VisualState.noShadows = v applyVisualEffects() end, false)
-VisualToggles.clockOverride = makeToggle(worldBox, "Override Clock Time", function(v) VisualState.clockOverride = v applyVisualEffects() end, false)
+VisualToggles.fullbright = makeToggle(worldBox, "Fullbright", function(v) VisualState.fullbright = v; applyVisualEffects() end, false)
+VisualToggles.noShadows = makeToggle(worldBox, "No Shadows", function(v) VisualState.noShadows = v; applyVisualEffects() end, false)
+VisualToggles.clockOverride = makeToggle(worldBox, "Override Clock Time", function(v) VisualState.clockOverride = v; applyVisualEffects() end, false)
 VisualSliders.worldTintHue = makeSlider(worldBox, "World Tint Hue", {
     min = 0, max = 1, get = function() return VisualState.worldTintHue end,
-    set = function(v) VisualState.worldTintHue = v applyVisualEffects() end,
+    set = function(v) VisualState.worldTintHue = v; applyVisualEffects() end,
     fmt = function(v) return string.format("%.0f%%", v * 100) end,
 })
 VisualSliders.worldTintStrength = makeSlider(worldBox, "Tint Strength", {
     min = 0, max = 0.85, get = function() return VisualState.worldTintStrength end,
-    set = function(v) VisualState.worldTintStrength = v applyVisualEffects() end,
+    set = function(v) VisualState.worldTintStrength = v; applyVisualEffects() end,
     fmt = function(v) return string.format("%.0f%%", v * 100) end,
 })
 VisualSliders.saturation = makeSlider(worldBox, "Saturation", {
     min = -1, max = 1, get = function() return VisualState.saturation end,
-    set = function(v) VisualState.saturation = v applyVisualEffects() end,
+    set = function(v) VisualState.saturation = v; applyVisualEffects() end,
     fmt = function(v) return string.format("%.2f", v) end,
 })
 VisualSliders.contrast = makeSlider(worldBox, "Contrast", {
     min = -1, max = 1, get = function() return VisualState.contrast end,
-    set = function(v) VisualState.contrast = v applyVisualEffects() end,
+    set = function(v) VisualState.contrast = v; applyVisualEffects() end,
     fmt = function(v) return string.format("%.2f", v) end,
 })
 VisualSliders.brightness = makeSlider(worldBox, "Brightness", {
     min = -1, max = 1, get = function() return VisualState.brightness end,
-    set = function(v) VisualState.brightness = v applyVisualEffects() end,
+    set = function(v) VisualState.brightness = v; applyVisualEffects() end,
     fmt = function(v) return string.format("%.2f", v) end,
 })
 VisualSliders.blurAmount = makeSlider(worldBox, "Blur", {
     min = 0, max = 56, get = function() return VisualState.blurAmount end,
-    set = function(v) VisualState.blurAmount = v applyVisualEffects() end,
+    set = function(v) VisualState.blurAmount = v; applyVisualEffects() end,
     fmt = function(v) return math.floor(v) .. "px" end,
 })
 VisualSliders.bloomAmount = makeSlider(worldBox, "Bloom", {
     min = 0, max = 2, get = function() return VisualState.bloomAmount end,
-    set = function(v) VisualState.bloomAmount = v applyVisualEffects() end,
+    set = function(v) VisualState.bloomAmount = v; applyVisualEffects() end,
     fmt = function(v) return string.format("%.2f", v) end,
 })
 VisualSliders.clockTime = makeSlider(worldBox, "Clock Time", {
     min = 0, max = 24, get = function() return VisualState.clockTime end,
-    set = function(v) VisualState.clockTime = v if VisualState.clockOverride then applyVisualEffects() end end,
+    set = function(v) VisualState.clockTime = v; if VisualState.clockOverride then applyVisualEffects() end end,
     fmt = function(v) return string.format("%.1fh", v) end,
 })
 makeButton(worldBox, "Reset World Visuals", function() resetAllVisuals() notify("World visuals reset", Accent) end)
@@ -6609,7 +7014,7 @@ makeSlider(moveBox, "Fly Speed", {
     min = 20, max = 400, get = function() return St.flySpeed end,
     set = function(v) St.flySpeed = v end, fmt = function(v) return math.floor(v) end,
 })
-Ref.noclipToggle = makeToggle(moveBox, "Noclip", function(v) St.noclip = v if not v then setNoclip(false) end end, St.noclip)
+Ref.noclipToggle = makeToggle(moveBox, "Noclip", function(v) St.noclip = v; if not v then setNoclip(false) end end, St.noclip)
 makeButton(moveBox, "Restore Movement Defaults", restoreMovement)
 
 -- ── Players tab ──
@@ -6687,7 +7092,7 @@ Ref.hideWmToggle = makeToggle(miscBox, "Hide Watermark", function(v)
 end, St.hideWatermark)
 Ref.featureCheckLbl = label(miscBox, "Feature checklist loads at runtime", 12, nil, 7)
 label(miscBox, "RightShift — toggle menu", 13, nil, 7)
-label(miscBox, "Legit: E aim | Q wallbang | Profiles in Config", 13, nil, 7)
+label(miscBox, "Legit: E aim | Silent LMB | Q wallbang | Profiles in Config", 13, nil, 7)
 
 -- Watermark
 WmOuter, WmInner = bordered(ScreenGui, MAIN, Accent, UDim2.fromOffset(118, 22), UDim2.new(1, -128, 1, -32), 20)
@@ -6713,7 +7118,7 @@ local winDrag, winDragStart, winStart = false, nil, nil
 TitleDrag.MouseButton1Down:Connect(function()
     winDrag = true
     winDragStart = UserInputService:GetMouseLocation()
-    winStart = WindowOuter.AbsolutePosition
+    winStart = WindowOuter.Position
 end)
 
 connect(UserInputService.InputChanged, function(i)
@@ -6721,24 +7126,27 @@ connect(UserInputService.InputChanged, function(i)
     if not winDrag then return end
     local m = UserInputService:GetMouseLocation()
     local d = m - winDragStart
-    WindowOuter.Position = UDim2.fromOffset(winStart.X + d.X, winStart.Y + d.Y)
+    WindowOuter.Position = UDim2.fromOffset(winStart.X.Offset + d.X, winStart.Y.Offset + d.Y)
 end)
 
-connect(UserInputService.InputEnded, function(i)
-    if i.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
-    if not winDrag then return end
-    winDrag = false
-    local cam = workspace.CurrentCamera
-    if cam then
-        local vp = cam.ViewportSize
-        local abs = WindowOuter.AbsolutePosition
-        local sz = WindowOuter.AbsoluteSize
-        local x, y = abs.X, abs.Y
-        if x < SNAP_DIST then x = 0 end
-        if y < SNAP_DIST then y = 0 end
-        if x + sz.X > vp.X - SNAP_DIST then x = vp.X - sz.X end
-        if y + sz.Y > vp.Y - SNAP_DIST then y = vp.Y - sz.Y end
-        WindowOuter.Position = UDim2.fromOffset(x, y)
+connect(UserInputService.InputEnded, function(i, gp)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 and winDrag then
+        winDrag = false
+        local cam = workspace.CurrentCamera
+        if cam then
+            local vp = cam.ViewportSize
+            local abs = WindowOuter.AbsolutePosition
+            local sz = WindowOuter.AbsoluteSize
+            local x, y = abs.X, abs.Y
+            if x < SNAP_DIST then x = 0 end
+            if y < SNAP_DIST then y = 0 end
+            if x + sz.X > vp.X - SNAP_DIST then x = vp.X - sz.X end
+            if y + sz.Y > vp.Y - SNAP_DIST then y = vp.Y - sz.Y end
+            WindowOuter.Position = UDim2.fromOffset(x, y)
+        end
+    end
+    if inputMatchesAimBind(i) then
+        handleAimBindEnded()
     end
 end)
 
@@ -6747,12 +7155,12 @@ end)
 -- ═══════════════════════════════════════════════════════════════
 
 connect(UserInputService.InputBegan, function(input, gp)
-    if isMenuToggleInput(input) and not St.rebinding then
+    if processRebindInput(input) then return end
+
+    if isMenuToggleInput(input) then
         toggleMenu()
         return
     end
-
-    if processRebindInput(input) then return end
 
     if inputMatchesAimBind(input) then
         handleAimBindBegan()
@@ -6765,12 +7173,6 @@ connect(UserInputService.InputBegan, function(input, gp)
     if input.KeyCode == St.wallbangKey and St.wallbang and St.wallbangMode == 2 then
         handleWallbangBindBegan()
         return
-    end
-end)
-
-connect(UserInputService.InputEnded, function(input, gp)
-    if inputMatchesAimBind(input) then
-        handleAimBindEnded()
     end
 end)
 
@@ -6817,8 +7219,8 @@ connect(RunService.Heartbeat, function(dt)
 
     refreshAimHoldState()
     refreshWallbangHoldState()
-    refreshWallbangLock()
-    syncWallbangHookState()
+    updateCombatHookWindow()
+    syncCombatHookState()
     updateMovement(dt)
     triggerbotStep()
 
@@ -6892,7 +7294,7 @@ end)
 
 
 print("[Cobalt Redux] Loaded - Legit/ESP/World/Move/Players/Config/Misc tabs ready.")
-syncWallbangHookState()
+syncCombatHookState()
 task.defer(function()
-    notify("Menu loaded — RightShift to hide | E = aim | Q = wallbang", Accent)
+    notify("Menu loaded — RightShift to hide | E = aim | Silent = LMB | Q = wallbang", Accent)
 end)
