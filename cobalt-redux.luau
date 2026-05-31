@@ -1,7 +1,7 @@
 --[[
     Cobalt Redux — Semi-blatant combat module (Randomizer Redux)
     GUI: Linoria-style linear init (loads immediately)
-    Legit: Camera aim + mouse fallback | Rage: auto-fire wallbang desync
+    Legit: Camera aim + mouse fallback | Rage: auto-fire wallbang orbit
 ]]
 
 local Players = game:GetService("Players")
@@ -94,7 +94,6 @@ local St = {
     aimToggled = false,
     aimHold = false,
     aimOnShoot = true,
-    silentAim = false,
     showFov = true,
     fov = 120,
     smooth = 0.25,
@@ -217,12 +216,11 @@ local DefaultJumpPower = 50
 local DefaultGravity = workspace.Gravity
 local SpinAngle = 0
 local LastTrigger = 0
-local SilentAimPart = nil
-local SilentAimPlayer = nil
-local PlayerMouse = nil
-local SilentHooksInstalled = false
-local OldSilentIndex, OldSilentNamecall
-local SilentAimTick = 0
+local WallbangTargetPart = nil
+local WallbangExpire = 0
+local WallbangHooksInstalled = false
+local OldWallbangNamecall
+local WallbangTracked = {}
 local NoclipParts = {}
 local Stats = { fps = 0, fpsTick = 0, start = tick() }
 local saveProfile, loadProfile, deleteProfile, refreshProfileList
@@ -579,14 +577,17 @@ end
 
 function canAim()
     if rageActive() then return true end
-    if St.silentAim then return false end
     if not aimActive() then return false end
     if St.aimOnShoot and not isShooting() then return false end
     return true
 end
 
+function wallbangWindowActive()
+    return St.wallbang and WallbangTargetPart and WallbangTargetPart.Parent and tick() <= WallbangExpire
+end
+
 function shouldWallbangIgnoreMap()
-    return rageActive() and St.wallbang
+    return wallbangWindowActive() or (rageActive() and St.wallbang)
 end
 
 function visibilityIgnoreList()
@@ -668,7 +669,7 @@ function bestTarget()
     local myRoot = getRoot(getChar(LocalPlayer))
     local origin = myRoot and myRoot.Position or cam.CFrame.Position
     local maxFov = rageActive() and math.huge or St.fov
-    local needVis = St.visibleCheck and not rageActive()
+    local needVis = St.visibleCheck and not rageActive() and not (St.wallbang and isFiring())
     local useDist = St.targetPriority == 2 or rageActive()
 
     if St.priorityUserId then
@@ -810,133 +811,188 @@ function fireClick()
     end)
 end
 
-local function silentAimActive()
-    return St.running and St.silentAim and not rageActive() and isFiring() and SilentAimPart ~= nil
-end
+local WALLBANG_PROJECTILE_KEYWORDS = { "bullet", "projectile", "shot", "ball", "beam", "ray", "bolt", "arrow", "shell", "round" }
 
 local function isHookCaller()
-    if checkcaller then
-        return checkcaller()
-    end
+    if checkcaller then return checkcaller() end
     return false
 end
 
 local function wrapClosure(fn)
-    if newcclosure then
-        return newcclosure(fn)
-    end
+    if newcclosure then return newcclosure(fn) end
     return fn
 end
 
-function getSilentHitCFrame()
-    if not SilentAimPart then return nil end
-    return CFrame.new(SilentAimPart.Position)
+function wallbangIgnoreList()
+    local t = visibilityIgnoreList()
+    for _, n in ipairs(MAP_FOLDERS) do
+        local f = workspace:FindFirstChild(n)
+        if f then t[#t + 1] = f end
+    end
+    return t
 end
 
-function getSilentUnitRay()
-    local cam = workspace.CurrentCamera
-    if not cam or not SilentAimPart then return nil end
-    local origin = cam.CFrame.Position
-    local delta = SilentAimPart.Position - origin
-    if delta.Magnitude < 0.05 then
-        return Ray.new(origin, cam.CFrame.LookVector)
-    end
-    return Ray.new(origin, delta.Unit)
-end
-
-function refreshSilentTarget()
-    if not St.running or not St.silentAim or rageActive() then
-        SilentAimPart = nil
-        SilentAimPlayer = nil
+function prepareWallbangShot()
+    if not St.wallbang then
+        WallbangTargetPart = nil
+        WallbangExpire = 0
         return
     end
-    if not isFiring() then
-        SilentAimPart = nil
-        SilentAimPlayer = nil
-        return
-    end
-    local now = tick()
-    if SilentAimPart and SilentAimPart.Parent and now - SilentAimTick < 0.05 then
-        return
-    end
-    SilentAimTick = now
     local target = bestTarget()
     if target then
-        SilentAimPlayer = target
-        SilentAimPart = getHitPart(getChar(target))
+        WallbangTargetPart = getHitPart(getChar(target))
+        WallbangExpire = tick() + 0.45
     else
-        SilentAimPlayer = nil
-        SilentAimPart = nil
+        WallbangTargetPart = nil
+        WallbangExpire = 0
     end
 end
 
-local function rewriteFireServerArgs(args)
-    if not SilentAimPart then return false end
-    local changed = false
-    for i, arg in ipairs(args) do
-        local t = typeof(arg)
-        if t == "Ray" then
-            local origin = arg.Origin
-            local dist = arg.Direction.Magnitude
-            if dist <= 0 then dist = 512 end
-            local dir = SilentAimPart.Position - origin
-            if dir.Magnitude > 0.05 then
-                args[i] = Ray.new(origin, dir.Unit * dist)
-                changed = true
-            end
-        elseif t == "Instance" and arg:IsA("BasePart") and SilentAimPlayer then
-            local tchar = getChar(SilentAimPlayer)
-            if tchar and arg:IsDescendantOf(tchar) then
-                args[i] = SilentAimPart
-                changed = true
-            end
-        end
-    end
-    return changed
+local function isCombatRayOrigin(origin)
+    if typeof(origin) ~= "Vector3" then return false end
+    local cam = workspace.CurrentCamera
+    local root = getRoot(getChar(LocalPlayer))
+    if cam and (origin - cam.CFrame.Position).Magnitude < 14 then return true end
+    if root and (origin - root.Position).Magnitude < 14 then return true end
+    return false
 end
 
-function installSilentHooks()
-    if SilentHooksInstalled or not hookmetamethod then return end
-
-    local function bindMouse()
-        pcall(function()
-            PlayerMouse = LocalPlayer:GetMouse()
-        end)
+local function raycastThroughWallbang(origin, direction, params)
+    local ignore = wallbangIgnoreList()
+    local p = RaycastParams.new()
+    p.FilterType = Enum.RaycastFilterType.Exclude
+    p.IgnoreWater = true
+    local merged, seen = {}, {}
+    for _, inst in ipairs(ignore) do
+        if inst and not seen[inst] then
+            seen[inst] = true
+            merged[#merged + 1] = inst
+        end
     end
-    bindMouse()
-    connect(LocalPlayer.CharacterAdded, function()
-        task.defer(bindMouse)
-    end)
-
-    OldSilentIndex = hookmetamethod(game, "__index", wrapClosure(function(self, key)
-        if silentAimActive() and not isHookCaller() and PlayerMouse and self == PlayerMouse then
-            if key == "Hit" then
-                local hit = getSilentHitCFrame()
-                if hit then return hit end
-            elseif key == "Target" then
-                return SilentAimPart
-            elseif key == "UnitRay" then
-                local ray = getSilentUnitRay()
-                if ray then return ray end
+    if params and params.FilterDescendantsInstances then
+        for _, inst in ipairs(params.FilterDescendantsInstances) do
+            if inst and not seen[inst] then
+                seen[inst] = true
+                merged[#merged + 1] = inst
             end
         end
-        return OldSilentIndex(self, key)
-    end))
+    end
+    p.FilterDescendantsInstances = merged
 
-    OldSilentNamecall = hookmetamethod(game, "__namecall", wrapClosure(function(self, ...)
-        if silentAimActive() and not isHookCaller() then
+    local function doRay(o, d)
+        if OldWallbangNamecall then
+            return OldWallbangNamecall(workspace, o, d, p)
+        end
+        return workspace:Raycast(o, d, p)
+    end
+
+    local result = doRay(origin, direction)
+    local target = WallbangTargetPart
+    if target and target.Parent then
+        local tmodel = target:FindFirstAncestorOfClass("Model")
+        local hitEnemy = result and result.Instance and tmodel and result.Instance:IsDescendantOf(tmodel)
+        if not hitEnemy then
+            local toTarget = target.Position - origin
+            if toTarget.Magnitude > 0.05 then
+                result = doRay(origin, toTarget)
+            end
+        end
+    end
+    return result
+end
+
+local function isLikelyProjectile(part)
+    if not part or not part:IsA("BasePart") then return false end
+    if LocalPlayer.Character and part:IsDescendantOf(LocalPlayer.Character) then return false end
+    local n = string.lower(part.Name)
+    for _, kw in ipairs(WALLBANG_PROJECTILE_KEYWORDS) do
+        if string.find(n, kw, 1, true) then return true end
+    end
+    local vel = part.AssemblyLinearVelocity.Magnitude
+    local small = part.Size.Magnitude <= 6
+    return small and vel > 8
+end
+
+function teleportProjectileToTarget(part)
+    if not wallbangWindowActive() or not part or WallbangTracked[part] then return end
+    if not isLikelyProjectile(part) then return end
+    WallbangTracked[part] = true
+    part.CFrame = CFrame.new(WallbangTargetPart.Position)
+    part.AssemblyLinearVelocity = Vector3.zero
+    part.AssemblyAngularVelocity = Vector3.zero
+end
+
+function installWallbangHooks()
+    if WallbangHooksInstalled or not hookmetamethod then return end
+
+    OldWallbangNamecall = hookmetamethod(game, "__namecall", wrapClosure(function(self, ...)
+        if wallbangWindowActive() and not isHookCaller() then
             local method = getnamecallmethod()
-            if method == "FireServer" or method == "InvokeServer" then
-                local args = { ... }
-                if rewriteFireServerArgs(args) then
-                    return OldSilentNamecall(self, table.unpack(args))
+            local args = { ... }
+
+            if method == "Raycast" and self == workspace then
+                local origin, direction = args[1], args[2]
+                if typeof(origin) == "Vector3" and typeof(direction) == "Vector3" and isCombatRayOrigin(origin) then
+                    return raycastThroughWallbang(origin, direction, args[3])
+                end
+            elseif method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList" then
+                local ray = args[1]
+                if typeof(ray) == "Ray" and isCombatRayOrigin(ray.Origin) then
+                    local target = WallbangTargetPart
+                    if target and target.Parent then
+                        local dist = ray.Direction.Magnitude
+                        if dist <= 0 then dist = 2048 end
+                        local dir = target.Position - ray.Origin
+                        if dir.Magnitude > 0.05 then
+                            args[1] = Ray.new(ray.Origin, dir.Unit * dist)
+                            return OldWallbangNamecall(self, table.unpack(args))
+                        end
+                    end
+                end
+            elseif method == "FireServer" or method == "InvokeServer" then
+                local target = WallbangTargetPart
+                if target and target.Parent then
+                    for i, arg in ipairs(args) do
+                        if typeof(arg) == "Ray" then
+                            local dist = arg.Direction.Magnitude
+                            if dist <= 0 then dist = 512 end
+                            local dir = target.Position - arg.Origin
+                            if dir.Magnitude > 0.05 then
+                                args[i] = Ray.new(arg.Origin, dir.Unit * dist)
+                            end
+                        elseif typeof(arg) == "Vector3" then
+                            local cam = workspace.CurrentCamera
+                            if cam and (arg - cam.CFrame.Position).Magnitude > 3 then
+                                args[i] = target.Position
+                            end
+                        elseif typeof(arg) == "Instance" and arg:IsA("BasePart") then
+                            local model = target:FindFirstAncestorOfClass("Model")
+                            if model and arg:IsDescendantOf(model) then
+                                args[i] = target
+                            end
+                        end
+                    end
+                    return OldWallbangNamecall(self, table.unpack(args))
                 end
             end
         end
-        return OldSilentNamecall(self, ...)
+        return OldWallbangNamecall(self, ...)
     end))
 
-    SilentHooksInstalled = true
+    connect(workspace.DescendantAdded, function(inst)
+        if not wallbangWindowActive() then return end
+        if inst:IsA("BasePart") then
+            teleportProjectileToTarget(inst)
+        end
+    end)
+
+    WallbangHooksInstalled = true
+end
+
+function clearWallbangShot()
+    WallbangTargetPart = nil
+    WallbangExpire = 0
+    table.clear(WallbangTracked)
 end
 
 function disableBarriers()
@@ -1526,7 +1582,7 @@ function serializeSettings()
         aimbot = St.aimbot, aimMode = St.aimMode,
         aimKey = keyCodeToName(St.aimKey), aimBindType = St.aimBindType,
         aimMouse = mouseTypeToName(St.aimMouse),
-        aimOnShoot = St.aimOnShoot, silentAim = St.silentAim,
+        aimOnShoot = St.aimOnShoot,
         showFov = St.showFov, fov = St.fov, smooth = St.smooth,
         visibleCheck = St.visibleCheck, hitPart = St.hitPart,
         teamCheck = St.teamCheck, targetPriority = St.targetPriority,
@@ -1599,8 +1655,8 @@ function applySettings(data, opts)
     if type(data.aimBindType) == "string" then St.aimBindType = data.aimBindType end
     if type(data.aimMouse) == "string" then St.aimMouse = applyMouseFromName(data.aimMouse, St.aimMouse) end
     applyBoolField(data, "aimOnShoot")
-    applyBoolField(data, "silentAim", Ref.silentToggle)
     applyBoolField(data, "showFov")
+    applyBoolField(data, "wallbang", Ref.wallbangToggle)
     applyNumField(data, "fov", 20, 400)
     applyNumField(data, "smooth", 0.05, 1)
     applyBoolField(data, "visibleCheck")
@@ -1813,6 +1869,7 @@ function triggerbotStep()
     local delay = St.triggerDelay + (math.random() * St.triggerRandom)
     if now - LastTrigger >= delay then
         LastTrigger = now
+        prepareWallbangShot()
         fireClick()
     end
 end
@@ -2261,9 +2318,9 @@ function updateStatusLabels()
         Ref.visCheckLbl.Text = "Visible Check: " .. (St.visibleCheck and "ON" or "OFF")
         Ref.visCheckLbl.TextColor3 = St.visibleCheck and Color3.fromRGB(80, 255, 120) or Color3.fromRGB(160, 160, 160)
     end
-    if Ref.silentLbl then
-        Ref.silentLbl.Text = "Silent Aim: " .. (St.silentAim and "ON (invisible spoof)" or "OFF")
-        Ref.silentLbl.TextColor3 = St.silentAim and Color3.fromRGB(80, 255, 120) or Color3.fromRGB(160, 160, 160)
+    if Ref.wallbangLbl then
+        Ref.wallbangLbl.Text = "Wallbang: " .. (St.wallbang and "ON" or "OFF")
+        Ref.wallbangLbl.TextColor3 = St.wallbang and Color3.fromRGB(80, 255, 120) or Color3.fromRGB(160, 160, 160)
     end
 
     if Ref.rageKeyLbl then
@@ -2319,6 +2376,7 @@ function combatStep()
                 local now = tick()
                 if now - LastFire >= 1 / 20 then
                     LastFire = now
+                    prepareWallbangShot()
                     fireClick()
                 end
             end
@@ -2333,16 +2391,9 @@ function combatStep()
     end
 end
 
-function silentAimStep()
-    if not St.silentAim then return end
-    refreshSilentTarget()
-end
-
 function unload()
     St.running = false
-    St.silentAim = false
-    SilentAimPart = nil
-    SilentAimPlayer = nil
+    clearWallbangShot()
     clearOrbitTarget()
     disableRageOrbitView()
     restoreBarriers()
@@ -2369,7 +2420,6 @@ end
 local PROFILE_BOOL_FIELDS = {
     "aimbot",
     "aimOnShoot",
-    "silentAim",
     "showFov",
     "visibleCheck",
     "teamCheck",
@@ -2455,7 +2505,6 @@ function dumpProfileSummary()
     local parts = {}
     if St.aimbot then parts[#parts + 1] = "aimbot" end
     if St.aimOnShoot then parts[#parts + 1] = "aimOnShoot" end
-    if St.silentAim then parts[#parts + 1] = "silentAim" end
     if St.showFov then parts[#parts + 1] = "showFov" end
     if St.visibleCheck then parts[#parts + 1] = "visibleCheck" end
     if St.teamCheck then parts[#parts + 1] = "teamCheck" end
@@ -2501,8 +2550,8 @@ function getProfile_aimbot() return St.aimbot end
 function setProfile_aimbot(v) if type(v) == "boolean" then St.aimbot = v end end
 function getProfile_aimOnShoot() return St.aimOnShoot end
 function setProfile_aimOnShoot(v) if type(v) == "boolean" then St.aimOnShoot = v end end
-function getProfile_silentAim() return St.silentAim end
-function setProfile_silentAim(v) if type(v) == "boolean" then St.silentAim = v end end
+function getProfile_silentAim() return false end
+function setProfile_silentAim(_) end
 function getProfile_showFov() return St.showFov end
 function setProfile_showFov(v) if type(v) == "boolean" then St.showFov = v end end
 function getProfile_visibleCheck() return St.visibleCheck end
@@ -2660,7 +2709,6 @@ end
 function countCombatFeaturesEnabled()
     local n = 0
     if St.aimbot then n += 1 end
-    if St.silentAim then n += 1 end
     if St.triggerbot then n += 1 end
     if St.ragebot then n += 1 end
     if St.autoFire then n += 1 end
@@ -2691,10 +2739,9 @@ end
 local ST_DOCS = {
     aimbot = { type = "boolean", desc = "Enable mouse aimbot", default = "false" },
     aimMode = { type = "number", desc = "1=Always 2=Toggle 3=Hold", default = "2" },
-    silentAim = { type = "boolean", desc = "Spoofs Mouse.Hit to server on LMB only — zero camera or crosshair movement", default = "false" },
     triggerbot = { type = "boolean", desc = "Auto fire when crosshair on enemy in FOV", default = "false" },
     ragebot = { type = "boolean", desc = "Enable rage combat mode", default = "false" },
-    wallbang = { type = "boolean", desc = "Ignore map in visibility raycasts when raging", default = "false" },
+    wallbang = { type = "boolean", desc = "Ignore walls on shot and teleport bullet to FOV target", default = "false" },
     autoFire = { type = "boolean", desc = "VirtualUser click while raging and shooting", default = "false" },
     desyncOrbit = { type = "boolean", desc = "Orbit around rage target HRP", default = "false" },
     barrierDisable = { type = "boolean", desc = "Disable kill barriers in map folders", default = "false" },
@@ -2734,7 +2781,7 @@ end
 
 function doc_aimbot() return ST_DOCS.aimbot.desc end
 function doc_aimMode() return ST_DOCS.aimMode.desc end
-function doc_silentAim() return ST_DOCS.silentAim.desc end
+function doc_silentAim() return "Removed — use Wallbang in Legit tab" end
 function doc_triggerbot() return ST_DOCS.triggerbot.desc end
 function doc_ragebot() return ST_DOCS.ragebot.desc end
 function doc_wallbang() return ST_DOCS.wallbang.desc end
@@ -2899,7 +2946,6 @@ end
 function snapshotCombatState()
     return {
         aimbot = St.aimbot,
-        silentAim = St.silentAim,
         triggerbot = St.triggerbot,
         ragebot = St.ragebot,
         autoFire = St.autoFire,
@@ -6387,7 +6433,8 @@ local miscStack = makeTab("Misc", TabRow2)
 local legitGuide = makeGroupbox(legitStack, "Quick Start")
 label(legitGuide, "1) Enable Aimbot + set your hold key below", 13, nil, 7)
 label(legitGuide, "2) Set Aim Mode to Hold — hold your key to lock on", 13, nil, 7)
-label(legitGuide, "3) Triggerbot: toggle ON = auto shoots visible enemies in crosshair", 13, nil, 7)
+label(legitGuide, "3) Wallbang: shoots through walls — bullet teleports to target", 13, nil, 7)
+label(legitGuide, "4) Triggerbot: toggle ON = auto shoots visible enemies in crosshair", 13, nil, 7)
 
 local legitKeys = makeGroupbox(legitStack, "Aimbot Keybinds")
 
@@ -6403,7 +6450,7 @@ Ref.aimStatus.Size = UDim2.fromOffset(40, 14)
 Ref.aimModeLbl = label(legitKeys, "Activation: Hold", 13, nil, 7)
 Ref.aimBindHelp = label(legitKeys, "Hold [E] to lock onto targets", 13, nil, 7)
 Ref.visCheckLbl = label(legitKeys, "Visible Check: OFF", 13, nil, 7)
-Ref.silentLbl = label(legitKeys, "Silent Aim: OFF (works standalone on LMB)", 13, nil, 7)
+Ref.wallbangLbl = label(legitKeys, "Wallbang: OFF", 13, nil, 7)
 
 makeCycle(legitKeys, "Aim Mode", AIM_MODES, function() return St.aimMode end, function(v)
     St.aimMode = v
@@ -6440,14 +6487,11 @@ makeToggle(legitSettings, "Visible Check", function(v)
     St.visibleCheck = v
 end, St.visibleCheck)
 
-Ref.silentToggle = makeToggle(legitSettings, "Silent Aim (invisible, server only)", function(v)
-    St.silentAim = v
-    if not v then
-        SilentAimPart = nil
-        SilentAimPlayer = nil
-    end
-end, St.silentAim)
-label(legitSettings, "No camera movement — only spoofs Mouse.Hit to server on LMB", 12, nil, 7)
+Ref.wallbangToggle = makeToggle(legitSettings, "Wallbang (shoot through walls)", function(v)
+    St.wallbang = v
+    if not v then clearWallbangShot() end
+end, St.wallbang)
+label(legitSettings, "Ignores map raycast on shot + teleports bullet to target", 12, nil, 7)
 
 makeToggle(legitSettings, "Show FOV Circle", function(v)
     St.showFov = v
@@ -6579,8 +6623,9 @@ makeToggle(rageFeatures, "Auto Fire", function(v)
     St.autoFire = v
 end, St.autoFire)
 
-makeToggle(rageFeatures, "Instant Wallbang (raycast ignore map)", function(v)
+makeToggle(rageFeatures, "Wallbang (also in Legit tab)", function(v)
     St.wallbang = v
+    if not v then clearWallbangShot() end
 end, St.wallbang)
 
 makeToggle(rageFeatures, "Orbit Camera (see yourself circle target)", function(v)
@@ -6937,8 +6982,8 @@ end)
 -- ═══════════════════════════════════════════════════════════════
 
 connect(UserInputService.InputBegan, function(input, gp)
-    if St.silentAim and input.UserInputType == Enum.UserInputType.MouseButton1 then
-        refreshSilentTarget()
+    if St.wallbang and input.UserInputType == Enum.UserInputType.MouseButton1 then
+        prepareWallbangShot()
     end
     if St.rebinding == "aim" then
         if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode ~= Enum.KeyCode.Unknown then
@@ -7076,7 +7121,6 @@ connect(RunService.RenderStepped, function(dt)
     if not St.running then return end
 
     combatStep()
-    silentAimStep()
     applyVisualEffects()
 
     if St.showFov then
@@ -7141,9 +7185,9 @@ end)
 
 
 print("[Cobalt Redux] Loaded - Legit/Rage/ESP/World/Move/Players/Config/Misc tabs ready.")
-installSilentHooks()
-if St.silentAim and not SilentHooksInstalled then
-    warn("[Cobalt Redux] Silent aim hooks unavailable — executor missing hookmetamethod")
+installWallbangHooks()
+if St.wallbang and not WallbangHooksInstalled then
+    warn("[Cobalt Redux] Wallbang hooks unavailable — executor missing hookmetamethod")
 end
 task.defer(function()
     notify("Menu loaded — RightShift to hide | E = aim | X = rage", Accent)
