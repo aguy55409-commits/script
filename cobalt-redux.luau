@@ -109,7 +109,7 @@ local St = {
     rageToggled = false,
     rageHold = false,
     wallbang = false,
-    wallbangDepth = 120,
+    wallbangDepth = 5,
     autoFire = false,
     desyncOrbit = false,
     orbitRadius = 14,
@@ -222,6 +222,9 @@ local WallbangSavedRootCF = nil
 local WallbangSavedCamCF = nil
 local WallbangVoidNoclip = false
 local WallbangInVoid = false
+local WallbangPlayerMouse = nil
+local WallbangHookInstalled = false
+local OldWallbangIndex = nil
 local NoclipParts = {}
 local Stats = { fps = 0, fpsTick = 0, start = tick() }
 local saveProfile, loadProfile, deleteProfile, refreshProfileList
@@ -856,12 +859,16 @@ function enterWallbangVoid(targetPart)
     local root = getRoot(getChar(LocalPlayer))
     if not root then return end
 
+    local char = targetPart:FindFirstAncestorOfClass("Model")
+    local tRoot = char and getRoot(char) or targetPart
+    local depth = math.max(St.wallbangDepth or 5, 2)
+    local voidPos = tRoot.Position - Vector3.new(0, depth, 0)
+
     if not WallbangSavedRootCF then
         WallbangSavedRootCF = root.CFrame
         local cam = workspace.CurrentCamera
         if cam then
             WallbangSavedCamCF = cam.CFrame
-            cam.CameraType = Enum.CameraType.Scriptable
         end
         if not St.noclip then
             setNoclip(true)
@@ -870,22 +877,63 @@ function enterWallbangVoid(targetPart)
         WallbangInVoid = true
     end
 
-    local depth = math.max(St.wallbangDepth or 120, 40)
-    local voidPos = Vector3.new(targetPart.Position.X, targetPart.Position.Y - depth, targetPart.Position.Z)
-
     root.CFrame = CFrame.new(voidPos, targetPart.Position)
-    if not WallbangInVoid then
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-    end
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
 end
 
 function updateWallbangCamera()
-    if not wallbangVoidActive() or not WallbangSavedCamCF then return end
+    if not wallbangVoidActive() or not WallbangTargetPart or not WallbangTargetPart.Parent then return end
     local cam = workspace.CurrentCamera
     if not cam then return end
+    local camPos = WallbangSavedCamCF and WallbangSavedCamCF.Position or cam.CFrame.Position
     cam.CameraType = Enum.CameraType.Scriptable
-    cam.CFrame = WallbangSavedCamCF
+    cam.CFrame = CFrame.new(camPos, WallbangTargetPart.Position)
+end
+
+function wallbangCombatStep()
+    if not wallbangShootActive() or not WallbangTargetPart or not WallbangTargetPart.Parent then return end
+    aimAtTarget(WallbangTargetPart, true)
+    if isFiring() then
+        pcall(function()
+            local char = getChar(LocalPlayer)
+            local tool = char and char:FindFirstChildOfClass("Tool")
+            if tool then tool:Activate() end
+        end)
+    end
+end
+
+local function installWallbangHooks()
+    if WallbangHookInstalled or not hookmetamethod then return end
+    pcall(function()
+        WallbangPlayerMouse = LocalPlayer:GetMouse()
+    end)
+    connect(LocalPlayer.CharacterAdded, function()
+        task.defer(function()
+            pcall(function() WallbangPlayerMouse = LocalPlayer:GetMouse() end)
+        end)
+    end)
+    local wrap = newcclosure or function(f) return f end
+    OldWallbangIndex = hookmetamethod(game, "__index", wrap(function(self, key)
+        if wallbangVoidActive() and isFiring() and WallbangTargetPart and WallbangPlayerMouse and self == WallbangPlayerMouse then
+            if key == "Hit" then
+                return CFrame.new(WallbangTargetPart.Position)
+            elseif key == "Target" then
+                return WallbangTargetPart
+            elseif key == "UnitRay" then
+                local cam = workspace.CurrentCamera
+                if cam then
+                    local o = cam.CFrame.Position
+                    local d = WallbangTargetPart.Position - o
+                    if d.Magnitude > 0.05 then
+                        return Ray.new(o, d.Unit)
+                    end
+                end
+            end
+        end
+        return OldWallbangIndex(self, key)
+    end))
+    WallbangHookInstalled = true
 end
 
 function updateWallbangVoid()
@@ -2293,6 +2341,11 @@ end
 function combatStep()
     if not St.running then return end
 
+    if wallbangVoidActive() and WallbangTargetPart then
+        wallbangCombatStep()
+        return
+    end
+
     if rageActive() then
         local target = getRageTarget()
         if target then
@@ -2666,7 +2719,7 @@ local ST_DOCS = {
     aimMode = { type = "number", desc = "1=Always 2=Toggle 3=Hold", default = "2" },
     triggerbot = { type = "boolean", desc = "Auto fire when crosshair on enemy in FOV", default = "false" },
     ragebot = { type = "boolean", desc = "Enable rage combat mode", default = "false" },
-    wallbang = { type = "boolean", desc = "TP player under map while shooting for clear bullet path", default = "false" },
+    wallbang = { type = "boolean", desc = "TP 5 studs below FOV target while shooting with clear aim", default = "false" },
     autoFire = { type = "boolean", desc = "VirtualUser click while raging and shooting", default = "false" },
     desyncOrbit = { type = "boolean", desc = "Orbit around rage target HRP", default = "false" },
     barrierDisable = { type = "boolean", desc = "Disable kill barriers in map folders", default = "false" },
@@ -6358,7 +6411,7 @@ local miscStack = makeTab("Misc", TabRow2)
 local legitGuide = makeGroupbox(legitStack, "Quick Start")
 label(legitGuide, "1) Enable Aimbot + set your hold key below", 13, nil, 7)
 label(legitGuide, "2) Set Aim Mode to Hold — hold your key to lock on", 13, nil, 7)
-label(legitGuide, "3) Wallbang: hold LMB — you go under map, shoot with clear LOS", 13, nil, 7)
+label(legitGuide, "3) Wallbang: hold LMB — you go 5 studs under them and shoot", 13, nil, 7)
 label(legitGuide, "4) Triggerbot: toggle ON = auto shoots visible enemies in crosshair", 13, nil, 7)
 
 local legitKeys = makeGroupbox(legitStack, "Aimbot Keybinds")
@@ -6412,13 +6465,13 @@ makeToggle(legitSettings, "Visible Check", function(v)
     St.visibleCheck = v
 end, St.visibleCheck)
 
-Ref.wallbangToggle = makeToggle(legitSettings, "Wallbang (void under map)", function(v)
+Ref.wallbangToggle = makeToggle(legitSettings, "Wallbang (5 studs under target)", function(v)
     St.wallbang = v
     if not v then clearWallbangShot() end
 end, St.wallbang)
-label(legitSettings, "Aim at enemy, hold LMB — body voids, camera stays locked so you can shoot", 12, nil, 7)
-makeSlider(legitSettings, "Void Depth (studs below target)", {
-    min = 40, max = 300,
+label(legitSettings, "Hold LMB near enemy — TP 5 studs below them, aim + shoot up", 12, nil, 7)
+makeSlider(legitSettings, "Depth Below Target (studs)", {
+    min = 2, max = 30,
     get = function() return St.wallbangDepth end,
     set = function(v) St.wallbangDepth = v end,
     fmt = function(v) return math.floor(v) .. " studs" end,
@@ -7121,6 +7174,7 @@ end)
 
 
 print("[Cobalt Redux] Loaded - Legit/Rage/ESP/World/Move/Players/Config/Misc tabs ready.")
+installWallbangHooks()
 task.defer(function()
     notify("Menu loaded — RightShift to hide | E = aim | X = rage", Accent)
 end)
