@@ -12,6 +12,7 @@ local TextService = game:GetService("TextService")
 local VirtualUser = game:GetService("VirtualUser")
 local HttpService = game:GetService("HttpService")
 local Lighting = game:GetService("Lighting")
+local GuiService = game:GetService("GuiService")
 
 local VirtualInputManager = nil
 pcall(function()
@@ -525,8 +526,23 @@ function isEnemy(plr)
     return true
 end
 
-function mousePos()
+function screenMouse()
     return UserInputService:GetMouseLocation()
+end
+
+function viewportMouse()
+    local mp = screenMouse()
+    local inset = GuiService:GetGuiInset()
+    return Vector2.new(mp.X, mp.Y - inset.Y)
+end
+
+function mousePos()
+    return viewportMouse()
+end
+
+function viewportToScreen(x, y)
+    local inset = GuiService:GetGuiInset()
+    return x + inset.X, y + inset.Y
 end
 
 function isShooting()
@@ -645,7 +661,7 @@ end
 
 
 function getAimPoint()
-    return UserInputService:GetMouseLocation()
+    return viewportMouse()
 end
 
 function sendMouseDelta(dx, dy, absX, absY)
@@ -655,10 +671,11 @@ function sendMouseDelta(dx, dy, absX, absY)
             mouseMoveRel(dx, dy)
             moved = true
         elseif mouseMoveAbs and absX and absY then
-            mouseMoveAbs(absX, absY)
+            local sx, sy = viewportToScreen(absX, absY)
+            mouseMoveAbs(sx, sy)
             moved = true
         elseif VirtualInputManager then
-            local mp = getAimPoint()
+            local mp = screenMouse()
             VirtualInputManager:SendMouseMoveEvent(mp.X + dx, mp.Y + dy, game)
             moved = true
         end
@@ -685,9 +702,10 @@ function aimAtTarget(part, snap)
         return sendMouseDelta(dx / sens, dy / sens, ap.X + dx / sens, ap.Y + dy / sens)
     end
 
-    -- Rage never snaps camera CFrame — that breaks mouse look / orbit view
     if rageActive() then
-        return aimViaMouse()
+        cam.CFrame = CFrame.new(cam.CFrame.Position, targetPos)
+        aimViaMouse()
+        return true
     end
 
     if St.thirdPerson then
@@ -720,11 +738,23 @@ end
 
 function fireClick()
     pcall(function()
+        if VirtualInputManager then
+            local mp = screenMouse()
+            VirtualInputManager:SendMouseButtonEvent(mp.X, mp.Y, 0, true, game, 0)
+            VirtualInputManager:SendMouseButtonEvent(mp.X, mp.Y, 0, false, game, 0)
+            return
+        end
+        if mouse1press and mouse1release then
+            mouse1press()
+            mouse1release()
+            return
+        end
         if mouse1click then
             mouse1click()
-        else
-            VirtualUser:ClickButton1(Vector2.new(0, 0))
+            return
         end
+        pcall(function() VirtualUser:CaptureController() end)
+        VirtualUser:ClickButton1(Vector2.new(0, 0))
     end)
 end
 
@@ -1543,7 +1573,7 @@ function crosshairTarget()
     local cam = workspace.CurrentCamera
     if not cam then return nil end
     local origin = cam.CFrame.Position
-    local mp = mousePos()
+    local mp = viewportMouse()
 
     local ray = cam:ViewportPointToRay(mp.X, mp.Y)
     local params = RaycastParams.new()
@@ -2086,11 +2116,13 @@ function combatStep()
         local target = getRageTarget()
         if target then
             aimAtTarget(getHitPart(getChar(target)), true)
-        end
-        local now = tick()
-        if now - LastFire >= 1 / 30 then
-            LastFire = now
-            fireClick()
+            if St.autoFire then
+                local now = tick()
+                if now - LastFire >= 1 / 30 then
+                    LastFire = now
+                    fireClick()
+                end
+            end
         end
         return
     end
@@ -6285,8 +6317,8 @@ Ref.rageBanner.TextWrapped = true
 Ref.rageBanner.Size = UDim2.new(1, -4, 0, 32)
 
 local rageGuide = makeGroupbox(rageStack, "Quick Start")
-label(rageGuide, "1) Enable Ragebot — locks ONE target, orbits + wallbang", 13, nil, 7)
-label(rageGuide, "2) Press X — orbit locked target (third-person zoom, normal camera)", 13, nil, 7)
+label(rageGuide, "1) Enable Ragebot — auto-locks target, aims, fires, orbits", 13, nil, 7)
+label(rageGuide, "2) Press X to toggle/hold rage off (Toggle/Hold modes)", 13, nil, 7)
 label(rageGuide, "Stays on same target until they die, then picks next", 13, nil, 7)
 
 local rageKeys = makeGroupbox(rageStack, "Rage Keybinds")
@@ -6323,7 +6355,17 @@ Ref.ragebotToggle = makeToggle(rageFeatures, "Enable Ragebot", function(v)
         St.wallbang = true
         St.autoFire = true
         St.desyncOrbit = true
-        notify("Rage armed — press X. Locks one target + orbit view.", Accent)
+        if St.rageMode == 2 then
+            St.rageToggled = true
+        elseif St.rageMode == 3 then
+            St.rageHold = false
+        end
+        local t = lockOrbitTarget()
+        if t then
+            notify("Rage ON — locked " .. t.DisplayName, Color3.fromRGB(255, 120, 80))
+        else
+            notify("Rage ON — waiting for target", Color3.fromRGB(255, 120, 80))
+        end
     else
         St.rageToggled = false
         St.rageHold = false
